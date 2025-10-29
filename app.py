@@ -1,20 +1,24 @@
+#!/usr/bin/env python3
 # app.py
 # -----------------------------------------------------------------------------
-# Lichess TensorFlow Bot - Render-ready
+# Lichess TF Bot — Deployment-ready script
 #
-# - Expects model file:  model.h5
-# - Expects vocab file:  vocab.npz  (contains array 'moves' mapping idx -> uci)
-# - Exposes Flask app object at module-level for Gunicorn: `gunicorn app:app`
-# - Connects to Lichess (use LICHESS_TOKEN env var), accepts challenges,
-#   supports both standard and position-based challenges (fromPosition),
-#   and plays moves using the TF model.
+# - Expects model file: model.h5
+# - Expects vocab file: vocab.npz (contains array 'moves' or similar)
+# - Optional env vars:
+#     LICHESS_TOKEN   - your bot token (required for playing)
+#     MODEL_URL       - HTTP(S) URL to download model.h5 if not committed
+#     VOCAB_URL       - HTTP(S) URL to download vocab.npz if not committed
+#     MODEL_PATH      - path to local model file (defaults model.h5)
+#     VOCAB_PATH      - path to local vocab file (defaults vocab.npz)
+#     HEALTH_SECRET   - optional secret required for admin endpoints
+#     DEFAULT_ARGMAX  - "true"/"false" default argmax behaviour
+#     DEFAULT_TOPK    - integer top-k default for sampling
+#     DEFAULT_TEMP    - float temperature default
+#     LOGDIR          - where to save PGNs
 #
-# Notes:
-# - Model trained on flattened 8x8x12 encoding (input shape 768).
-# - If you want to use external MODEL_URL/VOCAB_URL to download artifacts
-#   at boot, set those env vars in Render; the bot will download them once.
-#
-# Author: generated for Srivats (customized for your model/vocab)
+# - Exposes Flask app as module-level `app` for gunicorn app:app
+# - Robust streaming of lichess events and per-game handler
 # -----------------------------------------------------------------------------
 
 import os
@@ -32,309 +36,255 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 
-# Third-party dependencies
-# Ensure these are present in requirements.txt for Render: berserk, tensorflow, python-chess, Flask, gunicorn, numpy, requests, tqdm
+# third-party libs
 import numpy as np
 import chess
 import chess.pgn
 import berserk
 from flask import Flask, jsonify, request, abort
 from tensorflow.keras.models import load_model
-
-# Optional: for robust download with progress
 import requests
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION (change via env vars or edit here)
+# Configuration (environment-driven)
 # -----------------------------------------------------------------------------
-MODEL_FILENAME = os.environ.get("MODEL_PATH", "model.h5")
-VOCAB_FILENAME = os.environ.get("VOCAB_PATH", "vocab.npz")
-MODEL_URL = os.environ.get("MODEL_URL", None)  # optional remote URL to fetch model
-VOCAB_URL = os.environ.get("VOCAB_URL", None)  # optional remote URL to fetch vocab
-LICHESS_TOKEN_ENV = os.environ.get("LICHESS_TOKEN", None)  # must be set to bot token or provided at runtime
+MODEL_PATH = os.environ.get("MODEL_PATH", "model.h5")
+VOCAB_PATH = os.environ.get("VOCAB_PATH", "vocab.npz")
+MODEL_URL = os.environ.get("MODEL_URL", None)
+VOCAB_URL = os.environ.get("VOCAB_URL", None)
+LICHESS_TOKEN = os.environ.get("LICHESS_TOKEN", None)
+HEALTH_SECRET = os.environ.get("HEALTH_SECRET", None)
 LOG_DIR = os.environ.get("LOGDIR", "games")
-HEALTH_SECRET = os.environ.get("HEALTH_SECRET", None)  # optional: require secret for /admin endpoints
 
-# Move selection defaults
 DEFAULT_ARGMAX = os.environ.get("DEFAULT_ARGMAX", "true").lower() in ("1", "true", "yes")
 DEFAULT_TOPK = int(os.environ.get("DEFAULT_TOPK", "40"))
 DEFAULT_TEMP = float(os.environ.get("DEFAULT_TEMP", "1.0"))
 
-# Lichess retry/delay config
 MOVE_DELAY_SECONDS = float(os.environ.get("MOVE_DELAY_SECONDS", "0.6"))
-CHALLENGE_ACCEPT_DELAY = float(os.environ.get("CHALLENGE_ACCEPT_DELAY", "0.1"))
+CHALLENGE_ACCEPT_DELAY = float(os.environ.get("CHALLENGE_ACCEPT_DELAY", "0.2"))
 
-# Make sure the games dir exists
+# Create log directory
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # -----------------------------------------------------------------------------
-# Logging setup
+# Logging
 # -----------------------------------------------------------------------------
-logger = logging.getLogger("iwcm-bot")
+logger = logging.getLogger("iwcm_bot")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
-logger.addHandler(handler)
-
+ch = logging.StreamHandler(sys.stdout)
+ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
+logger.addHandler(ch)
 
 # -----------------------------------------------------------------------------
-# Utility: download file if URL provided
+# Convenience: download file (with progress) if remote URL is provided
 # -----------------------------------------------------------------------------
-def download_file(url: str, out_path: str, chunk_size: int = 8192, timeout: int = 120) -> None:
+def download_file(url: str, out_path: str, chunk_size: int = 8192, timeout: int = 120):
     """
-    Download a file from `url` to `out_path`. If out_path exists, skip download.
-    Uses streaming requests with a tqdm progress bar.
+    Download a file from url to out_path. Skip if file exists.
     """
     if not url:
-        raise ValueError("download_file: url is empty")
+        raise ValueError("No URL provided to download_file")
     if os.path.exists(out_path):
-        logger.info("download_file: %s already exists -> skipping download", out_path)
+        logger.info("download_file: %s exists; skipping", out_path)
         return
-
     logger.info("Downloading %s -> %s", url, out_path)
-    resp = requests.get(url, stream=True, timeout=timeout)
-    resp.raise_for_status()
-    total = int(resp.headers.get("content-length", 0))
-    tmp_path = out_path + ".tmp"
-    with open(tmp_path, "wb") as f:
+    r = requests.get(url, stream=True, timeout=timeout)
+    r.raise_for_status()
+    total = int(r.headers.get('content-length', 0))
+    tmp = out_path + ".tmp"
+    with open(tmp, "wb") as f:
         if total == 0:
-            # Unknown length
-            for chunk in resp.iter_content(chunk_size=chunk_size):
+            # unknown size
+            for chunk in r.iter_content(chunk_size=chunk_size):
                 if chunk:
                     f.write(chunk)
         else:
-            with tqdm(total=total, unit="B", unit_scale=True, desc=os.path.basename(out_path)) as pbar:
-                for chunk in resp.iter_content(chunk_size=chunk_size):
+            with tqdm(total=total, unit='B', unit_scale=True, desc=os.path.basename(out_path)) as pbar:
+                for chunk in r.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
                         pbar.update(len(chunk))
-    os.rename(tmp_path, out_path)
-    logger.info("Downloaded %s (%d bytes).", out_path, os.path.getsize(out_path))
-
+    os.replace(tmp, out_path)
+    logger.info("Downloaded %s (size=%d)", out_path, os.path.getsize(out_path))
 
 # -----------------------------------------------------------------------------
-# Model and vocab loader (safe reloadable)
+# Model / Vocab loader bundle
 # -----------------------------------------------------------------------------
 @dataclass
 class ModelBundle:
-    model_path: str
-    vocab_path: str
+    model_path: str = MODEL_PATH
+    vocab_path: str = VOCAB_PATH
     model: Optional[Any] = None
-    move_list: List[str] = field(default_factory=list)  # idx -> uci
+    move_list: List[str] = field(default_factory=list)
     move_to_idx: Dict[str, int] = field(default_factory=dict)
-    input_shape: Tuple[int, ...] = (768,)
+    input_shape: Tuple[int, ...] = (768,)  # default flattened 8*8*12
 
-    def ensure_files(self):
-        """
-        If MODEL_URL / VOCAB_URL env vars are set, attempt to download
-        the files to the configured paths.
-        """
+    def maybe_download(self):
         if MODEL_URL and not os.path.exists(self.model_path):
             try:
                 download_file(MODEL_URL, self.model_path)
-            except Exception as e:
-                logger.exception("Failed to download model: %s", e)
+            except Exception:
+                logger.exception("Failed to download model from MODEL_URL")
         if VOCAB_URL and not os.path.exists(self.vocab_path):
             try:
                 download_file(VOCAB_URL, self.vocab_path)
-            except Exception as e:
-                logger.exception("Failed to download vocab: %s", e)
+            except Exception:
+                logger.exception("Failed to download vocab from VOCAB_URL")
 
     def load_vocab(self):
         if not os.path.exists(self.vocab_path):
-            raise FileNotFoundError(f"Vocab file not found: {self.vocab_path}")
+            raise FileNotFoundError(f"vocab file not found: {self.vocab_path}")
         logger.info("Loading vocab from %s", self.vocab_path)
         data = np.load(self.vocab_path, allow_pickle=True)
-        # We expect an array `moves` with UCI strings (idx->move)
+        # Expect an array `moves` or similar; try keys
         if "moves" in data:
             moves = list(data["moves"])
-            logger.info("Found 'moves' in vocab: %d moves", len(moves))
+            logger.info("Loaded 'moves' key with %d entries", len(moves))
         else:
-            # fallback: take first key
-            first_key = list(data.files)[0]
-            moves = list(data[first_key])
-            logger.info("No 'moves' key; using first key '%s' (%d entries)", first_key, len(moves))
+            # use first array available
+            files = list(data.files)
+            if not files:
+                raise ValueError("vocab.npz contains no arrays")
+            moves = list(data[files[0]])
+            logger.info("Loaded first key '%s' with %d entries", files[0], len(moves))
         self.move_list = moves
-        self.move_to_idx = {m: i for i, m in enumerate(self.move_list)}
-        logger.info("Vocab loaded. Moves: %d", len(self.move_list))
+        self.move_to_idx = {m: i for i, m in enumerate(moves)}
+        logger.info("Vocab loaded, size=%d", len(self.move_list))
 
     def load_model(self):
         if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"Model file not found: {self.model_path}")
-        logger.info("Loading TF model from %s", self.model_path)
-        # Load via Keras; this will bring in TensorFlow
+            raise FileNotFoundError(f"model file not found: {self.model_path}")
+        logger.info("Loading model from %s", self.model_path)
         self.model = load_model(self.model_path)
-        # infer expected input shape from model if possible:
+        # attempt to determine input size
         try:
-            # keras models often have input_shape attr on first layer or model._functions
-            layer_input_shape = None
             if hasattr(self.model, "inputs") and self.model.inputs:
-                layer_input_shape = tuple(self.model.inputs[0].shape.as_list()[1:])
-            elif hasattr(self.model, "input_shape"):
-                layer_input_shape = tuple(self.model.input_shape[1:])
-            if layer_input_shape:
-                # flatten multi-dim to single dimension if necessary
+                shape = tuple(self.model.inputs[0].shape.as_list()[1:])
+                # flatten
                 dim = 1
-                for d in layer_input_shape:
-                    dim *= d
+                for d in shape:
+                    dim *= (d or 1)
                 self.input_shape = (dim,)
-                logger.info("Inferred model input size: %s -> flattened %d", layer_input_shape, dim)
+                logger.info("Inferred model input shape: %s -> flattened=%d", shape, dim)
+            elif hasattr(self.model, "input_shape"):
+                shape = tuple(self.model.input_shape[1:])
+                dim = 1
+                for d in shape:
+                    dim *= (d or 1)
+                self.input_shape = (dim,)
+                logger.info("Inferred model input shape: %s -> flattened=%d", shape, dim)
             else:
-                logger.info("Could not infer model input shape; using default %s", self.input_shape)
+                logger.info("Could not infer input shape; defaulting to %s", self.input_shape)
         except Exception:
-            logger.exception("Error inferring model input shape; using default %s", self.input_shape)
+            logger.exception("Error inferring model input shape; using default")
 
     def reload(self):
-        """
-        Download (if configured) and reload vocab + model.
-        """
-        logger.info("Reloading model bundle (model=%s, vocab=%s)", self.model_path, self.vocab_path)
-        self.ensure_files()
+        logger.info("Reloading model bundle...")
+        self.maybe_download()
         self.load_vocab()
         self.load_model()
         logger.info("Reload complete.")
 
+# instantiate bundle
+MODEL_BUNDLE = ModelBundle()
 
-# create global bundle
-MODEL_BUNDLE = ModelBundle(model_path=MODEL_FILENAME, vocab_path=VOCAB_FILENAME)
-# attempt initial load, but don't crash the import if files are missing; we log and continue
+# Try initial load but don't crash entire process; log instead.
 try:
     MODEL_BUNDLE.reload()
-except Exception:
-    logger.exception("Initial model/vocab load failed; you can call /admin/reload to retry")
-
+except Exception as e:
+    logger.exception("Initial model/vocab load failed: %s", e)
 
 # -----------------------------------------------------------------------------
 # Board encoding utilities (must match training)
-# - Training used 8x8x12 piece planes flattened.
-# - We must replicate exactly: planes order and rank/file orientation.
 # -----------------------------------------------------------------------------
-# plane mapping: piece symbol -> plane index
 PIECE_TO_PLANE = {
     "P": 0, "N": 1, "B": 2, "R": 3, "Q": 4, "K": 5,
     "p": 6, "n": 7, "b": 8, "r": 9, "q": 10, "k": 11
 }
 
-def fen_to_plane_array(fen: str) -> np.ndarray:
+def fen_to_planes(fen: str) -> np.ndarray:
     """
-    Convert FEN to 8x8x12 binary planes as used in training, shaped (8,8,12).
-    Note: This must match how you encoded boards when training your model.
-    We interpret individual board squares by `chess` package's square indexing:
-      - chess.square_file(sq): file 0..7 (a..h)
-      - chess.square_rank(sq): rank 0..7 (1..8)  -> bottom (rank 0) is first row here
-    The training used rank/file orientation producing an array where arr[rank,file,plane] = 1
+    Convert FEN to 8x8x12 binary planes (dtype uint8).
+    Uses chess.Board for parsing.
+    Orientation used: rank 0 is chess.square_rank 0 (board bottom)
+    This matches training if you trained with the same function.
     """
     board = chess.Board(fen)
     arr = np.zeros((8, 8, 12), dtype=np.uint8)
     for sq, piece in board.piece_map().items():
-        # chess.square_rank: 0..7; chess.square_file: 0..7
         r = chess.square_rank(sq)
         c = chess.square_file(sq)
         plane = PIECE_TO_PLANE.get(piece.symbol())
-        if plane is None:
-            continue
-        arr[r, c, plane] = 1
+        if plane is not None:
+            arr[r, c, plane] = 1
     return arr
 
-def fen_to_flat_input(fen: str) -> np.ndarray:
-    """
-    Convert FEN to flattened input vector of shape (1, 768) of dtype float32.
-    """
-    arr = fen_to_plane_array(fen)
-    flat = arr.reshape(-1).astype(np.float32)
+def fen_to_flat(fen: str) -> np.ndarray:
+    planes = fen_to_planes(fen)
+    flat = planes.reshape(-1).astype(np.float32)
     return flat.reshape(1, -1)  # shape (1, 768)
 
-
 # -----------------------------------------------------------------------------
-# Model inference / move selection helpers
+# Model inference helpers
 # -----------------------------------------------------------------------------
-def model_predict_probs(fen: str) -> np.ndarray:
-    """
-    Given a FEN, return model probability vector (len == vocab_size).
-    If model is not loaded, raise.
-    """
+def predict_prob_vector(fen: str) -> np.ndarray:
     if MODEL_BUNDLE.model is None:
-        raise RuntimeError("Model not loaded")
-    x = fen_to_flat_input(fen)
-    preds = MODEL_BUNDLE.model.predict(x, verbose=0)[0]  # vector
-    # ensure numeric numpy array
+        raise RuntimeError("Model is not loaded")
+    x = fen_to_flat(fen)
+    preds = MODEL_BUNDLE.model.predict(x, verbose=0)[0]
     return np.array(preds, dtype=np.float64)
 
-
-def softmax_with_temperature(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
+def softmax_temp(arr: np.ndarray, temp: float = 1.0) -> np.ndarray:
     if temp <= 0:
-        # treat 0 as argmax behavior in external code, but here we avoid division by zero
         temp = 1e-6
-    x = x / float(temp)
-    x = x - np.max(x)
-    e = np.exp(x)
-    p = e / (e.sum() + 1e-12)
-    return p
+    a = arr.astype(np.float64) / temp
+    a = a - np.max(a)
+    e = np.exp(a)
+    return e / (e.sum() + 1e-12)
 
-
-def choose_legal_move_from_probs(board: chess.Board, probs: np.ndarray,
-                                 argmax: bool = True, top_k: int = 40, temp: float = 1.0) -> Optional[str]:
+def choose_move_from_probs(board: chess.Board, probs: np.ndarray,
+                           argmax: bool = True, top_k: int = 40, temp: float = 1.0) -> Optional[str]:
     """
-    Given a board and a full-vocab probability vector, pick a legal UCI move.
-    - argmax True -> pick highest-prob legal
-    - argmax False -> sample among top_k legal moves using temperature
-    If no legal move is present in the vocab, return random legal move (string uci).
+    Choose a legal move for `board` guided by full-vocab `probs`.
+    If no legal moves are present in the vocab, pick a random legal move.
     """
-    legal_moves = [m.uci() for m in board.legal_moves]
-    if not legal_moves:
+    legal = [m.uci() for m in board.legal_moves]
+    if not legal:
         return None
-
-    # Map legal moves to vocabulary indices (if present)
-    legal_with_probs = []
-    for u in legal_moves:
+    legal_pairs = []
+    for u in legal:
         idx = MODEL_BUNDLE.move_to_idx.get(u)
-        if idx is not None and idx < len(probs):
-            legal_with_probs.append((u, float(probs[idx])))
-        else:
-            # Not in vocab -> will be considered separately
-            pass
-
-    if not legal_with_probs:
-        # No legal moves in vocab: fallback to random legal
-        return random.choice(legal_moves)
-
-    # sort descending by prob
-    legal_with_probs.sort(key=lambda x: -x[1])
-    ucis = [p[0] for p in legal_with_probs]
-    pv = np.array([p[1] for p in legal_with_probs], dtype=np.float64)
-
+        if idx is not None and 0 <= idx < len(probs):
+            legal_pairs.append((u, float(probs[idx])))
+    if not legal_pairs:
+        # fallback: random legal move
+        return random.choice(legal)
+    legal_pairs.sort(key=lambda x: -x[1])
+    ucis = [p[0] for p in legal_pairs]
+    vals = np.array([p[1] for p in legal_pairs], dtype=np.float64)
     if argmax:
         return ucis[0]
-
-    # sampling path
-    k = min(top_k, len(pv))
-    top_p = pv[:k]
-    if top_p.sum() <= 0:
-        # uniform among top_k legal moves
-        probs_sample = np.ones_like(top_p) / len(top_p)
+    k = min(top_k, len(vals))
+    top_vals = vals[:k]
+    if top_vals.sum() <= 0:
+        probs_sample = np.ones_like(top_vals) / len(top_vals)
     else:
-        probs_sample = softmax_with_temperature(top_p, temp)
+        probs_sample = softmax_temp(top_vals, temp)
     choice = np.random.choice(range(k), p=probs_sample)
     return ucis[choice]
 
-
 # -----------------------------------------------------------------------------
-# PGN saving utility
+# PGN logging
 # -----------------------------------------------------------------------------
-def save_game_pgn_file(game_id: str, white_name: str, black_name: str, moves: List[str], result: str, out_dir: str = LOG_DIR) -> str:
-    """
-    Save a simple PGN file to out_dir/<game_id>.pgn with headers and move list.
-    Returns path.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{game_id}.pgn")
+def save_pgn(game_id: str, white_name: str, black_name: str, moves: List[str], result: Optional[str], outdir: str = LOG_DIR) -> str:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f"{game_id}.pgn")
     game = chess.pgn.Game()
     game.headers["Event"] = "Lichess Bot Game"
     game.headers["White"] = white_name
     game.headers["Black"] = black_name
     game.headers["Result"] = result if result else "*"
-
     node = game
     board = chess.Board()
     for uci in moves:
@@ -343,246 +293,246 @@ def save_game_pgn_file(game_id: str, white_name: str, black_name: str, moves: Li
             node = node.add_variation(mv)
             board.push(mv)
         except Exception:
-            # skip illegal moves in logging
+            # skip invalid during saving
             pass
-
     with open(path, "w", encoding="utf-8") as f:
         f.write(str(game))
     logger.info("Saved PGN to %s", path)
     return path
 
-
 # -----------------------------------------------------------------------------
-# Lichess bot event handling and main loop
+# Lichess Bot Class
 # -----------------------------------------------------------------------------
 class LichessBot:
-    def __init__(self, token: Optional[str] = None,
-                 argmax: bool = DEFAULT_ARGMAX, top_k: int = DEFAULT_TOPK, temp: float = DEFAULT_TEMP):
-        self.token = token or LICHESS_TOKEN_ENV
+    def __init__(self, token: Optional[str] = None, argmax: bool = DEFAULT_ARGMAX, top_k: int = DEFAULT_TOPK, temp: float = DEFAULT_TEMP):
+        self.token = token or LICHESS_TOKEN
         self.client = None
-        self.running = False
-        self._thread = None
         self.argmax = argmax
         self.top_k = top_k
         self.temp = temp
-        self.active_games: Dict[str, threading.Thread] = {}  # game_id -> thread
+        self.running = False
+        self._thread = None
+        self.active_games: Dict[str, threading.Thread] = {}
+        self._account_cache: Optional[dict] = None
+        self._lock = threading.Lock()
+        self._last_event_time = time.time()
 
     def connect(self):
         if not self.token:
-            raise RuntimeError("Lichess token not provided")
+            raise RuntimeError("No LICHESS token provided")
+        logger.info("Connecting to Lichess API")
         session = berserk.TokenSession(self.token)
-        self.client = berserk.Client(session=session)
-        me = self.client.account.get()
-        logger.info("Connected to lichess as %s (id=%s)", me.get("username"), me.get("id"))
+        client = berserk.Client(session=session)
+        # test account
+        me = client.account.get()
+        logger.info("Connected to Lichess as %s (id=%s)", me.get("username"), me.get("id"))
+        self.client = client
+        self._account_cache = me
         return me
 
-    def accept_challenge(self, challenge_id: str):
+    def get_my_id(self):
+        if self._account_cache:
+            return self._account_cache.get("id")
         try:
-            self.client.bots.accept_challenge(challenge_id)
-            logger.info("Accepted challenge %s", challenge_id)
-        except Exception as e:
-            logger.exception("Failed to accept challenge %s: %s", challenge_id, e)
+            me = self.client.account.get()
+            self._account_cache = me
+            return me.get("id")
+        except Exception:
+            return None
 
-    def decline_challenge(self, challenge_id: str):
+    def accept_challenge(self, chal_id: str):
         try:
-            self.client.bots.decline_challenge(challenge_id)
-            logger.info("Declined challenge %s", challenge_id)
-        except Exception as e:
-            logger.exception("Failed to decline challenge %s: %s", challenge_id, e)
+            self.client.bots.accept_challenge(chal_id)
+            logger.info("Accepted challenge %s", chal_id)
+        except Exception:
+            logger.exception("Failed to accept challenge %s", chal_id)
 
-    def handle_incoming_events(self):
-        """
-        Main loop streaming incoming events. This method runs in the bot thread.
-        """
-        if self.client is None:
-            self.connect()
-
-        logger.info("Starting stream of incoming events...")
+    def decline_challenge(self, chal_id: str):
         try:
-            for event in self.client.bots.stream_incoming_events():
-                try:
-                    self._process_event(event)
-                except Exception as e:
-                    logger.exception("Error processing incoming event: %s", e)
-        except Exception as e:
-            logger.exception("Exception while streaming incoming events: %s", e)
-            # try reconnect after short sleep
-            time.sleep(5)
-            raise
+            self.client.bots.decline_challenge(chal_id)
+            logger.info("Declined challenge %s", chal_id)
+        except Exception:
+            logger.exception("Failed to decline challenge %s", chal_id)
 
-    def _process_event(self, event: dict):
-        etype = event.get("type")
-        if etype == "challenge":
+    def handle_event(self, event: dict):
+        t = event.get("type")
+        if t == "challenge":
             chal = event["challenge"]
-            challenger = chal.get("challenger", {}).get("name", "<unknown>")
             variant = chal.get("variant", {}).get("key")
-            speed = chal.get("speed")
-            logger.info("Incoming challenge from %s: variant=%s speed=%s id=%s", challenger, variant, speed, chal.get("id"))
-            # Accept standard and 'fromPosition' (position) challenges, decline others
-            if variant == "standard" or variant == "fromPosition":
+            challenger = chal.get("challenger", {}).get("name")
+            chal_id = chal.get("id")
+            logger.info("Challenge from %s variant=%s id=%s", challenger, variant, chal_id)
+            # Accept standard and fromPosition variant; else decline
+            if variant in ("standard", "fromPosition"):
                 try:
-                    # small delay to avoid rate-limit flurries
                     time.sleep(CHALLENGE_ACCEPT_DELAY)
-                    self.client.bots.accept_challenge(chal["id"])
-                    logger.info("Accepted challenge %s (from %s)", chal["id"], challenger)
+                    self.accept_challenge(chal_id)
                 except Exception:
-                    # If accept fails for any reason, decline
+                    # fallback: decline
                     try:
-                        self.client.bots.decline_challenge(chal["id"])
-                        logger.info("Declined challenge %s after acceptance error", chal["id"])
+                        self.decline_challenge(chal_id)
                     except Exception:
-                        logger.exception("Both accept and decline failed for challenge %s", chal["id"])
+                        logger.exception("Failed both accept and decline for %s", chal_id)
             else:
-                # decline unsupported variant
                 try:
-                    self.client.bots.decline_challenge(chal["id"])
-                    logger.info("Declined unsupported challenge variant=%s id=%s", variant, chal["id"])
+                    self.decline_challenge(chal_id)
                 except Exception:
-                    logger.exception("Failed to decline challenge %s", chal["id"])
+                    logger.exception("Failed to decline unsupported variant chal %s", chal_id)
 
-        elif etype == "gameStart":
+        elif t == "gameStart":
             game_id = event["game"]["id"]
             logger.info("Game started: %s", game_id)
-            # spawn per-game handler in separate thread
-            t = threading.Thread(target=self.run_game_loop, args=(game_id,))
-            t.daemon = True
-            t.start()
-            self.active_games[game_id] = t
+            th = threading.Thread(target=self.game_loop, args=(game_id,))
+            th.daemon = True
+            th.start()
+            with self._lock:
+                self.active_games[game_id] = th
         else:
-            logger.debug("Unhandled incoming event type: %s", etype)
+            logger.debug("Unhandled incoming event: %s", t)
 
-    def run_game_loop(self, game_id: str):
-        """
-        For a started game, stream the game state and play when it is our turn.
-        """
-        logger.info("[%s] Starting game loop", game_id)
-        moves_so_far: List[str] = []
+    def stream_events_forever(self):
+        if self.client is None:
+            self.connect()
+        logger.info("Starting incoming events stream")
         try:
-            for state in self.client.bots.stream_game_state(game_id):
+            for event in self.client.bots.stream_incoming_events():
+                self._last_event_time = time.time()
                 try:
-                    # state may be 'gameFull' (initial) and then 'gameState' updates
-                    moves_token = state.get("moves", "").strip()
-                    moves_list = moves_token.split() if moves_token else []
-                    # rebuild the board
-                    board = chess.Board()
-                    for mv in moves_list:
-                        try:
-                            board.push_uci(mv)
-                        except Exception:
-                            logger.debug("[%s] ignore push_uci failed for mv=%s", game_id, mv)
-                    # who is white/black
-                    white_id = state.get("white", {}).get("id")
-                    black_id = state.get("black", {}).get("id")
-                    white_name = state.get("white", {}).get("name", white_id)
-                    black_name = state.get("black", {}).get("name", black_id)
-
-                    # check if game has ended
-                    status = state.get("status")
-                    if status in ("mate", "resign", "timeout", "draw", "outoftime", "stalemate"):
-                        # save PGN and exit
-                        winner = state.get("winner")
-                        result_str = "1-0" if winner == "white" else ("0-1" if winner == "black" else "1/2-1/2")
-                        save_game_pgn_file(game_id, white_name, black_name, moves_list, result_str, out_dir=LOG_DIR)
-                        logger.info("[%s] Game ended status=%s result=%s", game_id, status, result_str)
-                        break
-
-                    # is it our turn?
-                    is_my_turn = False
-                    me = self.client.account.get()
-                    my_id = me.get("id")
-                    if board.turn:
-                        is_my_turn = (white_id == my_id)
-                    else:
-                        is_my_turn = (black_id == my_id)
-
-                    if is_my_turn:
-                        # choose move
-                        try:
-                            probs = model_predict_probs(board.fen())
-                        except Exception as e:
-                            logger.exception("[%s] model predict failed: %s", game_id, e)
-                            # fallback to random
-                            chosen = random.choice([m.uci() for m in board.legal_moves])
-                            try:
-                                self.client.bots.make_move(game_id, chosen)
-                                logger.info("[%s] Fallback played %s", game_id, chosen)
-                            except Exception:
-                                logger.exception("[%s] fallback make_move failed", game_id)
-                            time.sleep(MOVE_DELAY_SECONDS)
-                            continue
-
-                        chosen_uci = choose_legal_move_from_probs(board, probs,
-                                                                  argmax=self.argmax,
-                                                                  top_k=self.top_k,
-                                                                  temp=self.temp)
-                        if chosen_uci is None:
-                            logger.warning("[%s] No move chosen by model -> skipping", game_id)
-                        else:
-                            # sanity check legality again
-                            if chosen_uci not in [m.uci() for m in board.legal_moves]:
-                                logger.warning("[%s] Chosen move %s not legal; picking random", game_id, chosen_uci)
-                                chosen_uci = random.choice([m.uci() for m in board.legal_moves])
-
-                            try:
-                                self.client.bots.make_move(game_id, chosen_uci)
-                                logger.info("[%s] Played move %s", game_id, chosen_uci)
-                            except Exception as e:
-                                logger.exception("[%s] make_move failed for %s : %s", game_id, chosen_uci, e)
-                        # avoid flooding
-                        time.sleep(MOVE_DELAY_SECONDS)
+                    self.handle_event(event)
                 except Exception:
-                    logger.exception("[%s] inner game loop error", game_id)
+                    logger.exception("Error handling incoming event")
         except Exception:
-            logger.exception("[%s] stream_game_state ended with exception", game_id)
-        finally:
-            # ensure we remove from active list
-            try:
-                if game_id in self.active_games:
-                    del self.active_games[game_id]
-            except Exception:
-                pass
-            logger.info("[%s] game loop finished", game_id)
+            logger.exception("Stream incoming events terminated unexpectedly")
+            raise
 
-    def start(self):
-        if self.running:
-            logger.info("Bot already running")
-            return
+    def run(self):
+        # Keep reconnecting if stream breaks
         self.running = True
-        self._thread = threading.Thread(target=self._run_thread)
-        self._thread.daemon = True
-        self._thread.start()
-        logger.info("Bot thread started")
-
-    def _run_thread(self):
-        # loop and attempt to reconnect if streaming breaks
         while self.running:
             try:
-                self.connect()
-                self.handle_incoming_events()
+                if self.client is None:
+                    self.connect()
+                self.stream_events_forever()
             except Exception:
-                logger.exception("Bot encountered exception in main loop, will retry in 5s")
+                logger.exception("Bot main loop exception; reconnecting in 5s")
                 time.sleep(5)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            logger.info("Bot already running")
+            return
+        self._thread = threading.Thread(target=self.run, daemon=True)
+        self._thread.start()
+        logger.info("Bot thread started")
 
     def stop(self):
         self.running = False
         logger.info("Stopping bot")
-        try:
-            if self._thread is not None:
-                self._thread.join(timeout=2.0)
-        except Exception:
-            pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
 
+    def game_loop(self, game_id: str):
+        """
+        Stream game state for a specific game and play moves when it's our turn.
+        Uses client.bots.stream_game_state(game_id)
+        """
+        logger.info("[%s] Starting game loop", game_id)
+        moves_list: List[str] = []
+        white_name = black_name = None
+        try:
+            for state in self.client.bots.stream_game_state(game_id):
+                # State may contain 'moves' string
+                moves_token = state.get("moves", "").strip()
+                moves_list = moves_token.split() if moves_token else []
+                # Build board
+                board = chess.Board()
+                for mv in moves_list:
+                    try:
+                        board.push_uci(mv)
+                    except Exception:
+                        # ignore illegal pushes when reconstructing board for safety
+                        logger.debug("[%s] invalid move in moves_list: %s", game_id, mv)
+
+                # Update player names
+                white_name = state.get("white", {}).get("name") or state.get("white", {}).get("id")
+                black_name = state.get("black", {}).get("name") or state.get("black", {}).get("id")
+
+                # Check for finished game
+                status = state.get("status")
+                if status in ("mate", "resign", "timeout", "draw", "outoftime", "stalemate"):
+                    winner = state.get("winner")
+                    result_str = "1-0" if winner == "white" else ("0-1" if winner == "black" else "1/2-1/2")
+                    save_pgn(game_id, white_name or "white", black_name or "black", moves_list, result_str)
+                    logger.info("[%s] Game ended status=%s result=%s", game_id, status, result_str)
+                    break
+
+                # Determine if it's our turn
+                # Obtain my id
+                my_id = self.get_my_id()
+                if my_id is None:
+                    # try updating account cache
+                    try:
+                        me = self.client.account.get()
+                        my_id = me.get("id")
+                        self._account_cache = me
+                    except Exception:
+                        logger.warning("[%s] Could not get my account id; skipping move detection", game_id)
+                        time.sleep(1.0)
+                        continue
+
+                # Determine whose turn by board.turn boolean
+                is_my_turn = (board.turn and state.get("white", {}).get("id") == my_id) or (not board.turn and state.get("black", {}).get("id") == my_id)
+
+                if is_my_turn:
+                    # It's our turn: predict and play
+                    try:
+                        probs = predict_prob_vector(board.fen())
+                    except Exception as e:
+                        logger.exception("[%s] Model prediction failed: %s", game_id, e)
+                        # fallback: random legal
+                        fallback = random.choice([m.uci() for m in board.legal_moves])
+                        try:
+                            self.client.bots.make_move(game_id, fallback)
+                            logger.info("[%s] Fallback random move played: %s", game_id, fallback)
+                        except Exception:
+                            logger.exception("[%s] Fallback make_move failed", game_id)
+                        time.sleep(MOVE_DELAY_SECONDS)
+                        continue
+
+                    chosen = choose_move_from_probs(board, probs, argmax=self.argmax, top_k=self.top_k, temp=self.temp)
+                    if chosen is None:
+                        logger.warning("[%s] No chosen move; skipping", game_id)
+                    else:
+                        # sanity: ensure legality
+                        if chosen not in [m.uci() for m in board.legal_moves]:
+                            logger.warning("[%s] Chosen move %s not legal; picking random legal", game_id, chosen)
+                            chosen = random.choice([m.uci() for m in board.legal_moves])
+                        try:
+                            self.client.bots.make_move(game_id, chosen)
+                            logger.info("[%s] Played move %s", game_id, chosen)
+                        except Exception:
+                            logger.exception("[%s] make_move failed for %s", game_id, chosen)
+                    # slight delay to avoid potential rate limit issues
+                    time.sleep(MOVE_DELAY_SECONDS)
+                # continue streaming until end
+        except Exception:
+            logger.exception("[%s] Exception in game loop", game_id)
+        finally:
+            with self._lock:
+                try:
+                    if game_id in self.active_games:
+                        del self.active_games[game_id]
+                except Exception:
+                    pass
+            logger.info("[%s] game loop terminated", game_id)
 
 # -----------------------------------------------------------------------------
-# Flask app and endpoints (expose health, status, reload)
+# Flask app and endpoints
 # -----------------------------------------------------------------------------
 flask_app = Flask(__name__)
 
 @flask_app.route("/", methods=["GET"])
 def health():
-    """
-    Basic health endpoint. Returns status and some runtime info.
-    """
     try:
         model_ok = MODEL_BUNDLE.model is not None
         vocab_ok = bool(MODEL_BUNDLE.move_list)
@@ -592,85 +542,84 @@ def health():
             "model_loaded": model_ok,
             "vocab_size": len(MODEL_BUNDLE.move_list),
             "active_games": active_count,
-            "argmax": BOT.argmax if BOT is not None else DEFAULT_ARGMAX,
-            "top_k": BOT.top_k if BOT is not None else DEFAULT_TOPK,
-            "temp": BOT.temp if BOT is not None else DEFAULT_TEMP
+            "argmax_default": DEFAULT_ARGMAX,
+            "top_k_default": DEFAULT_TOPK,
+            "temp_default": DEFAULT_TEMP
         })
     except Exception:
-        logger.exception("Error in health endpoint")
+        logger.exception("health endpoint error")
         return jsonify({"status": "error"}), 500
 
-
 @flask_app.route("/predict", methods=["POST"])
-def predict_move_endpoint():
+def predict_endpoint():
     """
-    POST JSON: { "fen": "<FEN>", "argmax": true/false (optional), "top_k": int, "temp": float }
-    Returns predicted UCI move and scores for top-N.
+    POST JSON:
+      {
+        "fen": "<FEN>",
+        "argmax": true/false (optional),
+        "top_k": int (optional),
+        "temp": float (optional)
+      }
+    Response:
+      {
+        "chosen_move": "e2e4",
+        "top_moves": [...],
+        "top_scores": [...]
+      }
     """
     try:
         payload = request.get_json(force=True)
         fen = payload.get("fen")
         if not fen:
-            return jsonify({"error": "Missing 'fen'"}), 400
+            return jsonify({"error": "missing fen"}), 400
         argmax = payload.get("argmax", BOT.argmax if BOT else DEFAULT_ARGMAX)
         top_k = int(payload.get("top_k", BOT.top_k if BOT else DEFAULT_TOPK))
         temp = float(payload.get("temp", BOT.temp if BOT else DEFAULT_TEMP))
-
-        # quick board validation
+        # Validate fen
         try:
             board = chess.Board(fen)
         except Exception as e:
-            return jsonify({"error": f"Invalid FEN: {str(e)}"}), 400
-
-        probs = model_predict_probs(fen)
-        # compute top moves (over full vocab)
-        top_indices = np.argsort(probs)[::-1][:min(50, len(probs))]
-        top_moves = []
-        scores = []
-        for idx in top_indices:
-            move = MODEL_BUNDLE.move_list[idx] if idx < len(MODEL_BUNDLE.move_list) else None
-            top_moves.append(move)
-            scores.append(float(probs[idx]))
-
-        # choose legal recommended move
-        chosen = choose_legal_move_from_probs(board, probs, argmax=argmax, top_k=top_k, temp=temp)
+            return jsonify({"error": f"invalid fen: {e}"}), 400
+        probs = predict_prob_vector(fen)
+        # top-n over full vocab
+        top_n = min(50, len(probs))
+        idxs = np.argsort(probs)[::-1][:top_n]
+        top_moves = [MODEL_BUNDLE.move_list[i] if i < len(MODEL_BUNDLE.move_list) else None for i in idxs]
+        top_scores = [float(probs[i]) for i in idxs]
+        chosen = choose_move_from_probs(board, probs, argmax=argmax, top_k=top_k, temp=temp)
         return jsonify({
             "chosen_move": chosen,
-            "argmax": argmax,
+            "argmax": bool(argmax),
             "top_k": top_k,
             "temp": temp,
             "top_moves": top_moves,
-            "top_scores": scores
+            "top_scores": top_scores
         })
     except Exception:
-        logger.exception("Error in /predict")
+        logger.exception("predict endpoint error")
         return jsonify({"error": "server error"}), 500
 
+def _check_health_secret(payload: dict) -> bool:
+    if not HEALTH_SECRET:
+        return True
+    if not payload:
+        return False
+    return payload.get("secret") == HEALTH_SECRET
 
 @flask_app.route("/admin/reload", methods=["POST"])
 def admin_reload():
-    """
-    Admin endpoint to reload the model and vocab. If HEALTH_SECRET is set, require it.
-    POST JSON {"secret": "..."} if HEALTH_SECRET is used.
-    """
     try:
-        if HEALTH_SECRET:
-            payload = request.get_json(force=True)
-            if not payload or payload.get("secret") != HEALTH_SECRET:
-                return jsonify({"error": "bad secret"}), 403
-
+        payload = request.get_json(force=True)
+        if not _check_health_secret(payload):
+            return jsonify({"error": "bad secret"}), 403
         MODEL_BUNDLE.reload()
         return jsonify({"status": "reloaded", "vocab_size": len(MODEL_BUNDLE.move_list)})
     except Exception:
-        logger.exception("Reload failed")
+        logger.exception("admin reload failed")
         return jsonify({"error": "reload failed"}), 500
-
 
 @flask_app.route("/admin/stats", methods=["GET"])
 def admin_stats():
-    """
-    Return some debug stats for the running bot
-    """
     try:
         stats = {
             "model_loaded": MODEL_BUNDLE.model is not None,
@@ -682,21 +631,15 @@ def admin_stats():
         }
         return jsonify(stats)
     except Exception:
-        logger.exception("admin_stats failed")
+        logger.exception("admin stats failed")
         return jsonify({"error": "server error"}), 500
-
 
 @flask_app.route("/admin/set_params", methods=["POST"])
 def admin_set_params():
-    """
-    Change sampling parameters at runtime. Body JSON examples:
-    { "argmax": false, "top_k": 20, "temp": 0.8 }
-    """
     try:
         payload = request.get_json(force=True)
-        if HEALTH_SECRET:
-            if not payload or payload.get("secret") != HEALTH_SECRET:
-                return jsonify({"error": "bad secret"}), 403
+        if not _check_health_secret(payload):
+            return jsonify({"error": "bad secret"}), 403
         if BOT is None:
             return jsonify({"error": "bot not running"}), 400
         if "argmax" in payload:
@@ -707,73 +650,73 @@ def admin_set_params():
             BOT.temp = float(payload["temp"])
         return jsonify({"status": "ok", "argmax": BOT.argmax, "top_k": BOT.top_k, "temp": BOT.temp})
     except Exception:
-        logger.exception("admin_set_params failed")
+        logger.exception("admin set_params failed")
         return jsonify({"error": "server error"}), 500
 
-
 # -----------------------------------------------------------------------------
-# Module-level bot instance and Flask app exposure for gunicorn
+# Module-level BOT instance and app exposure for gunicorn
 # -----------------------------------------------------------------------------
-# Instantiate the bot (token may be set via env var on Render)
 BOT = None
 try:
-    BOT = LichessBot(token=os.environ.get("LICHESS_TOKEN"), argmax=DEFAULT_ARGMAX, top_k=DEFAULT_TOPK, temp=DEFAULT_TEMP)
-    # Start the bot in background once the module is imported (Gunicorn will import)
-    # We start after a short delay via a thread so app import completes fast.
-    def _delayed_start():
+    BOT = LichessBot(token=LICHESS_TOKEN, argmax=DEFAULT_ARGMAX, top_k=DEFAULT_TOPK, temp=DEFAULT_TEMP)
+    def _starter():
+        # small delay to allow import to complete and Render to finish startup
         time.sleep(1.0)
         try:
+            logger.info("Starting BOT from module import")
             BOT.start()
         except Exception:
-            logger.exception("Failed to start BOT")
-    threading.Thread(target=_delayed_start, daemon=True).start()
+            logger.exception("Failed to start BOT on import")
+    threading.Thread(target=_starter, daemon=True).start()
 except Exception:
-    logger.exception("Failed to create BOT instance at module import; you can create manually via /admin endpoints")
+    logger.exception("Failed to instantiate BOT at module import")
 
-
-# Expose Flask app variable for gunicorn: `gunicorn app:app`
+# Expose Flask app as `app`
 app = flask_app
 
-
 # -----------------------------------------------------------------------------
-# If run directly (python app.py) provide CLI to run in foreground for local testing
+# CLI & local-run support
 # -----------------------------------------------------------------------------
-def run_local_server(host="0.0.0.0", port:int = None):
-    host = host or "0.0.0.0"
-    port = port or int(os.environ.get("PORT", 8000))
-    logger.info("Starting local Flask server on %s:%d", host, port)
+def run_local_server(port: int = 8000, host: str = "0.0.0.0"):
+    logger.info("Running local Flask server on %s:%d", host, port)
     app.run(host=host, port=port, debug=False, threaded=True)
 
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Lichess TF Bot (app.py)")
-    parser.add_argument("--model", default=MODEL_FILENAME, help="Path to .h5 model file")
-    parser.add_argument("--vocab", default=VOCAB_FILENAME, help="Path to vocab.npz")
-    parser.add_argument("--token", default=None, help="Lichess bot token (or set LICHESS_TOKEN env var)")
-    parser.add_argument("--no-start", action="store_true", help="Do not auto-start the bot thread (for debugging)")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
+    parser = argparse.ArgumentParser(description="Lichess TF Bot - app.py")
+    parser.add_argument("--model", default=MODEL_PATH, help="Path to model.h5")
+    parser.add_argument("--vocab", default=VOCAB_PATH, help="Path to vocab.npz")
+    parser.add_argument("--token", default=os.environ.get("LICHESS_TOKEN"), help="Lichess bot token")
+    parser.add_argument("--no-start", action="store_true", help="Don't auto-start bot thread (debug)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)), help="Local port")
+    parser.add_argument("--argmax", action="store_true", help="Start bot with argmax mode")
+    parser.add_argument("--topk", type=int, default=DEFAULT_TOPK, help="Top-k sampling")
+    parser.add_argument("--temp", type=float, default=DEFAULT_TEMP, help="Sampling temperature")
     args = parser.parse_args()
 
-    # If user requests different model/vocab paths, reload bundle
-    if args.model != MODEL_BUNDLE.model_path or args.vocab != MODEL_BUNDLE.vocab_path:
-        MODEL_BUNDLE.model_path = args.model
-        MODEL_BUNDLE.vocab_path = args.vocab
-        try:
-            MODEL_BUNDLE.reload()
-        except Exception:
-            logger.exception("reload failed at start")
+    # override bundle paths if provided
+    MODEL_BUNDLE.model_path = args.model
+    MODEL_BUNDLE.vocab_path = args.vocab
+    try:
+        MODEL_BUNDLE.reload()
+    except Exception:
+        logger.exception("Initial reload at CLI failed")
 
-    # Replace the running BOT instance's token if provided
+    # replace token if provided
     if args.token:
         if BOT:
             BOT.token = args.token
         else:
             BOT = LichessBot(token=args.token)
-
-    if not args.no_start:
-        if BOT is None:
+    if BOT:
+        BOT.argmax = args.argmax or BOT.argmax
+        BOT.top_k = args.topk
+        BOT.temp = args.temp
+        if not args.no_start:
+            BOT.start()
+    else:
+        if not args.no_start:
             BOT = LichessBot(token=args.token)
-        BOT.start()
+            BOT.start()
 
     run_local_server(port=args.port)
 
