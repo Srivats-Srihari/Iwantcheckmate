@@ -40,8 +40,8 @@ except Exception as e:
 STORAGE_DIR = os.environ.get("LOGDIR", "games")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-LICHESS_TOKEN_ENV_NAME = "Lichess_token"  # preserved to match your code
-LICHESS_TOKEN = os.environ.get(LICHESS_TOKEN_ENV_NAME)
+  # preserved to match your code
+LICHESS_TOKEN = os.environ.get('Lichess_token')
 if not LICHESS_TOKEN:
     logging.warning("No Lichess token found in env var '%s'. Bot will not start until you set it.", LICHESS_TOKEN_ENV_NAME)
 
