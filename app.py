@@ -40,7 +40,6 @@ except Exception as e:
 STORAGE_DIR = os.environ.get("LOGDIR", "games")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "./stockfish")  # unused but kept for familiarity
 LICHESS_TOKEN_ENV_NAME = "Lichess_token"  # preserved to match your code
 LICHESS_TOKEN = os.environ.get(LICHESS_TOKEN_ENV_NAME)
 if not LICHESS_TOKEN:
