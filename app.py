@@ -1,20 +1,14 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# app.py
 """
-app.py - Lichess player-imitation bot (single-file deployment)
-Author: generated for you
-Description:
-  - Loads your model.h5 and vocab.npz (if present)
-  - Connects to Lichess via berserk, accepts standard/fromPosition challenges
-  - Spawns per-game handler threads that reconstruct board state from moves
-  - Runs model inference (if MODEL available) using several encoders
-  - Chooses legal move from model logits or falls back to statistical imitation
-  - Dashboard and admin endpoints (Flask)
-  - Verbose logging and diagnostics
+Imitation bot app - robust, hybrid model + position DB selection
+- Loads model.h5, vocab.npz, pos_db.npz
+- Connects to Lichess with berserk
+- Accepts standard/fromPosition challenges
+- Hybrid move selection: pos_db (exact FEN) + model logits + weighted imitation fallback
+- Admin endpoints for diagnostics and reload
 """
 
 from __future__ import annotations
-
 import os
 import sys
 import time
@@ -23,279 +17,182 @@ import math
 import random
 import threading
 import traceback
-from collections import Counter, defaultdict, deque
-from typing import Dict, Any, List, Optional, Tuple
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Tuple, Any
 
-# third-party libs
-try:
-    import numpy as np
-except Exception as e:
-    print("ERROR: numpy is required. Install with `pip install numpy`.")
-    raise
+import numpy as np
+import chess
+import berserk
+from flask import Flask, jsonify, request, render_template_string, send_file
 
-try:
-    import berserk
-except Exception:
-    print("ERROR: berserk is required. Install with `pip install berserk`.")
-    raise
-
-try:
-    import chess
-    import chess.pgn
-except Exception:
-    print("ERROR: python-chess is required. Install with `pip install python-chess`.")
-    raise
-
-# optional TensorFlow/Keras model support
+# Optional TensorFlow
 try:
     import tensorflow as tf
-    from tensorflow.keras.models import load_model as tf_load_model
+    from tensorflow.keras.models import load_model as keras_load_model
 except Exception:
     tf = None
-    tf_load_model = None
+    keras_load_model = None
 
-# flask for dashboard & admin
-try:
-    from flask import Flask, jsonify, request, send_file, render_template_string, abort
-except Exception:
-    print("ERROR: Flask is required. Install with `pip install Flask`.")
-    raise
-
-# ============================
-# Configuration (env variables)
-# ============================
-# Lichess token (required)
-LICHESS_TOKEN_ENV = os.environ.get("LICHESS_TOKEN_ENV", "Lichess_token")
-LICHESS_TOKEN = os.environ.get(LICHESS_TOKEN_ENV) or os.environ.get("LICHESS_TOKEN")
-
+# ----------------------------
+# Config via ENV (defaults)
+# ----------------------------
+LICHESS_TOKEN = os.environ.get("Lichess_token")
 if not LICHESS_TOKEN:
-    # we won't crash here so the code can still run for testing without Lichess connection,
-    # but you must set this env var to actually accept challenges.
-    print("WARNING: Lichess token not found in env var", LICHESS_TOKEN_ENV)
+    print("WARNING: Set Lichess_token env var to connect to Lichess")
 
-# Paths
 MODEL_PATH = os.environ.get("MODEL_PATH", "model.h5")
 VOCAB_PATH = os.environ.get("VOCAB_PATH", "vocab.npz")
-STORAGE_DIR = os.environ.get("STORAGE_DIR", "saved_games")
+POS_DB_PATH = os.environ.get("POS_DB_PATH", "pos_db.npz")
+PORT = int(os.environ.get("PORT", "10000"))
 
-# Inference and imitation tuning
 ARGMAX = os.environ.get("ARGMAX", "false").lower() in ("1", "true", "yes")
-TOP_K = int(os.environ.get("TOP_K", "32"))
-TEMPERATURE = float(os.environ.get("TEMP", "1.0"))
+TOP_K = int(os.environ.get("TOP_K", "8"))
+TEMP = float(os.environ.get("TEMP", "0.05"))
+ALPHA = float(os.environ.get("ALPHA", "0.6"))  # model weight in hybrid mix
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "64"))
 
-# Debug/testing toggles
+# Debug
 DEBUG_FORCE_RANDOM = os.environ.get("DEBUG_FORCE_RANDOM", "false").lower() in ("1", "true", "yes")
-DEBUG_FORCE_OPENING = os.environ.get("DEBUG_FORCE_OPENING", "")  # e.g. "e2e4 e7e5"
 DEBUG_LOG_PROBS = os.environ.get("DEBUG_LOG_PROBS", "true").lower() in ("1", "true", "yes")
 
-# Streaming + retry/backoff policy
-BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "1.0"))
-BACKOFF_MAX = float(os.environ.get("BACKOFF_MAX", "60.0"))
-MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "6"))
-
-# misc
-PORT = int(os.environ.get("PORT", "10000"))
-MOVE_DELAY = float(os.environ.get("MOVE_DELAY", "0.10"))
-HEARTBEAT_TIMEOUT = int(os.environ.get("HEARTBEAT_TIMEOUT", "180"))
-SEQ_LEN = int(os.environ.get("SEQ_LEN", "128"))
-
-# ensure dirs
-os.makedirs(STORAGE_DIR, exist_ok=True)
-
-# =============
-# Logging helper
-# =============
-def log(*args, **kwargs):
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    print(stamp, *args, **kwargs)
-    sys.stdout.flush()
-
-# ========================
-# Global application state
-# ========================
+# ----------------------------
+# Global state
+# ----------------------------
 MODEL = None
 MODEL_INPUT_SHAPE = None
 IDX2MOVE: List[str] = []
 MOVE2IDX: Dict[str, int] = {}
 VOCAB_SIZE = 0
-MOVE_FREQ: Counter = Counter()
+MOVE_FREQ = Counter()
 
-# games dictionary: game_id -> info dict
+POS_DB: Dict[str, List[Tuple[str,int]]] = {}  # fen -> [(move, count), ...]
+POS_DB_LOADED = False
+
 GAMES: Dict[str, Dict[str, Any]] = {}
 GAMES_LOCK = threading.Lock()
 
-# per-game thread references (so we can monitor/join if needed)
-GAME_THREADS: Dict[str, threading.Thread] = {}
-GAME_THREADS_LOCK = threading.Lock()
+# berserk client
+CLIENT = None
 
-# berserk global client (created when token present)
-_GLOBAL_CLIENT: Optional[berserk.Client] = None
-_GLOBAL_CLIENT_LOCK = threading.Lock()
+# ----------------------------
+# Logging
+# ----------------------------
+def log(*args, **kwargs):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    print(ts, *args, **kwargs)
+    sys.stdout.flush()
 
-# event thread
-_event_thread: Optional[threading.Thread] = None
-_event_thread_lock = threading.Lock()
-_stop_flag = threading.Event()
-
-# ============================
-# Utility: exponential backoff
-# ============================
-def retry_call(func, *args, max_attempts: int = MAX_ATTEMPTS, base_wait: float = BACKOFF_BASE, **kwargs):
-    wait = base_wait
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            s = str(e)
-            log(f"[retry] attempt {attempt}/{max_attempts} failed: {s}")
-            if "429" in s or "Too Many Requests" in s:
-                log(f"[retry] rate limited — sleeping {wait}s")
-                time.sleep(wait)
-                wait = min(wait * 2.0, BACKOFF_MAX)
-                continue
-            if attempt == max_attempts:
-                log("[retry] reached max attempts — raising")
-                raise
-            time.sleep(min(wait, BACKOFF_MAX))
-            wait = min(wait * 2.0, BACKOFF_MAX)
-    raise RuntimeError("retry_call exhausted")
-
-# =====================================
-# Create and return a berserk client
-# =====================================
-def create_global_client():
-    global _GLOBAL_CLIENT
-    with _GLOBAL_CLIENT_LOCK:
-        if _GLOBAL_CLIENT is None:
-            if not LICHESS_TOKEN:
-                raise RuntimeError("Lichess token not set. Set env var " + LICHESS_TOKEN_ENV)
-            session = berserk.TokenSession(LICHESS_TOKEN)
-            _GLOBAL_CLIENT = berserk.Client(session=session)
-            log("Created global berserk client")
-    return _GLOBAL_CLIENT
-
-# =================================================
-# Vocab loader: load vocab.npz and construct maps
-# =================================================
-def load_vocab_npz(path: str = VOCAB_PATH):
-    """
-    Loads a vocab.npz file with a 'moves' key (UCI strings like 'e2e4').
-    It is robust to common variations:
-      - keys: 'moves', 'vocab', 'idx2move', 'move2idx', etc.
-    On success populates IDX2MOVE, MOVE2IDX, VOCAB_SIZE, MOVE_FREQ.
-    """
+# ----------------------------
+# Load vocab.npz (moves)
+# ----------------------------
+def load_vocab(path: str = VOCAB_PATH):
     global IDX2MOVE, MOVE2IDX, VOCAB_SIZE, MOVE_FREQ
     if not os.path.exists(path):
-        log(f"[vocab] file not found: {path}")
-        IDX2MOVE, MOVE2IDX, VOCAB_SIZE = [], {}, 0
-        MOVE_FREQ = Counter()
+        log("[vocab] not found:", path)
+        IDX2MOVE, MOVE2IDX, VOCAB_SIZE, MOVE_FREQ = [], {}, 0, Counter()
         return
-
     data = np.load(path, allow_pickle=True)
-    keys = list(data.files)
-    log("[vocab] npz keys:", keys)
-
-    moves = None
+    keys = data.files
+    log("[vocab] keys:", keys)
     if "moves" in data.files:
-        moves = data["moves"]
+        arr = data["moves"]
     elif "vocab" in data.files:
-        moves = data["vocab"]
-    elif "idx2move" in data.files:
-        moves = data["idx2move"]
+        arr = data["vocab"]
     else:
-        # fallback: pick the first array-like that looks like tokens
-        for k in keys:
-            arr = data[k]
-            try:
-                cand = [str(x) for x in arr.tolist()]
-                # heuristic: tokens are short strings
-                if len(cand) > 50 and all(1 <= len(s) <= 8 for s in cand[:50]):
-                    moves = arr
-                    log(f"[vocab] fallback using key {k}")
-                    break
-            except Exception:
-                continue
-
-    if moves is None:
-        log("[vocab] failed to find move list in npz")
-        IDX2MOVE, MOVE2IDX, VOCAB_SIZE = [], {}, 0
-        MOVE_FREQ = Counter()
-        return
-
-    # convert to python list of strings
-    try:
-        IDX2MOVE = [str(x) for x in moves.tolist()]
-    except Exception:
-        try:
-            IDX2MOVE = [str(x) for x in moves]
-        except Exception:
-            IDX2MOVE = []
-
-    MOVE2IDX = {m: i for i, m in enumerate(IDX2MOVE)}
+        arr = data[data.files[0]]
+    IDX2MOVE = [str(x) for x in arr.tolist()]
+    MOVE2IDX = {m:i for i,m in enumerate(IDX2MOVE)}
     VOCAB_SIZE = len(IDX2MOVE)
-    # frequency: if moves came from a large flattened list, use counts
     MOVE_FREQ = Counter(IDX2MOVE)
+    log(f"[vocab] loaded {VOCAB_SIZE} moves")
 
-    log(f"[vocab] loaded {VOCAB_SIZE} tokens")
-
-# =================================================
-# Model loader: load Keras model.h5 if TF is present
-# =================================================
-def load_keras_model(path: str = MODEL_PATH):
-    """
-    Loads Keras model using tf.keras.models.load_model.
-    Sets MODEL global and tries to infer input shape.
-    """
-    global MODEL, MODEL_INPUT_SHAPE
-    if tf_load_model is None:
-        log("[model] TensorFlow/Keras not available in this runtime. Skipping model load.")
-        MODEL = None
-        MODEL_INPUT_SHAPE = None
-        return
-
+# ----------------------------
+# Load pos_db.npz
+# ----------------------------
+def load_pos_db(path: str = POS_DB_PATH):
+    global POS_DB, POS_DB_LOADED
+    POS_DB = {}
     if not os.path.exists(path):
-        log(f"[model] model file not found: {path}")
+        log("[pos_db] not found:", path)
+        POS_DB_LOADED = False
+        return
+    data = np.load(path, allow_pickle=True)
+    fens = data['fens'].tolist()
+    moves_list = data['moves_list'].tolist()
+    for fen, moves in zip(fens, moves_list):
+        POS_DB[fen] = [(mv, int(cnt)) for mv,cnt in moves]
+    POS_DB_LOADED = True
+    log("[pos_db] loaded entries:", len(POS_DB))
+
+def get_pos_probs(fen: str) -> Optional[np.ndarray]:
+    """Return a length-VOCAB_SIZE probability vector for the exact fen or None"""
+    if not POS_DB_LOADED:
+        return None
+    entry = POS_DB.get(fen)
+    if not entry:
+        return None
+    probs = np.zeros(VOCAB_SIZE, dtype=float)
+    total = 0
+    for mv, cnt in entry:
+        idx = MOVE2IDX.get(mv)
+        if idx is not None:
+            probs[idx] += cnt
+            total += cnt
+    if total == 0:
+        return None
+    probs /= probs.sum()
+    return probs
+
+# ----------------------------
+# Load Keras model.h5
+# ----------------------------
+def load_keras(path: str = MODEL_PATH):
+    global MODEL, MODEL_INPUT_SHAPE
+    if keras_load_model is None:
+        log("[model] TensorFlow/Keras not available in this runtime. MODEL disabled.")
         MODEL = None
         MODEL_INPUT_SHAPE = None
         return
-
+    if not os.path.exists(path):
+        log("[model] file not found:", path)
+        MODEL = None
+        MODEL_INPUT_SHAPE = None
+        return
     try:
-        log(f"[model] loading model from {path} ...")
-        MODEL = tf_load_model(path)
-        # infer input shape
+        log("[model] loading", path)
+        MODEL = keras_load_model(path)
         try:
             inp = MODEL.inputs[0].shape
             if hasattr(inp, "as_list"):
-                dims = inp.as_list()
+                MODEL_INPUT_SHAPE = inp.as_list()
             else:
-                dims = tuple(inp)
-            MODEL_INPUT_SHAPE = tuple(dims)
+                MODEL_INPUT_SHAPE = tuple(inp)
         except Exception:
             MODEL_INPUT_SHAPE = None
-        log(f"[model] loaded. input_shape={MODEL_INPUT_SHAPE}")
+        log("[model] loaded. input_shape:", MODEL_INPUT_SHAPE)
     except Exception as e:
-        log("[model] load failed:", e)
+        log("[model] load exception:", e)
         MODEL = None
         MODEL_INPUT_SHAPE = None
 
-# ============================
-# Initialize model & vocab
-# ============================
-load_vocab_npz(VOCAB_PATH)
-load_keras_model(MODEL_PATH)
-
-# ------------------------------
-# Encoders (sequence, planes, one-hot)
-# ------------------------------
+# ----------------------------
+# Encoders (same as trainer)
+# ----------------------------
 PIECE_TO_PLANE = {
-    "P": 0, "N": 1, "B": 2, "R": 3, "Q": 4, "K": 5,
-    "p": 6, "n": 7, "b": 8, "r": 9, "q": 10, "k": 11
+    "P":0,"N":1,"B":2,"R":3,"Q":4,"K":5,
+    "p":6,"n":7,"b":8,"r":9,"q":10,"k":11
 }
 
+def encode_planes(board: chess.Board) -> np.ndarray:
+    arr = np.zeros((8,8,12), dtype=np.float32)
+    for sq, piece in board.piece_map().items():
+        r = chess.square_rank(sq)
+        c = chess.square_file(sq)
+        plane = PIECE_TO_PLANE[piece.symbol()]
+        arr[r,c,plane] = 1.0
+    return arr.reshape(1, -1).astype(np.float32)
+
 def encode_sequence(board: chess.Board, seq_len: int = SEQ_LEN) -> np.ndarray:
-    """
-    Returns shape (1, seq_len) int32 array where tokens are idx+1 (0 reserved for padding).
-    """
     moves = [m.uci() for m in board.move_stack]
     toks = []
     for mv in moves[-seq_len:]:
@@ -305,25 +202,7 @@ def encode_sequence(board: chess.Board, seq_len: int = SEQ_LEN) -> np.ndarray:
         toks = [0] * (seq_len - len(toks)) + toks
     return np.array(toks, dtype=np.int32).reshape(1, seq_len)
 
-def encode_planes(board: chess.Board) -> np.ndarray:
-    """
-    Returns shape (1, 8*8*12) float32 array representing piece planes.
-    board.piece_map() uses square indices; we fill rows by rank 0..7.
-    """
-    arr = np.zeros((8, 8, 12), dtype=np.float32)
-    for sq, piece in board.piece_map().items():
-        r = chess.square_rank(sq)
-        c = chess.square_file(sq)
-        plane = PIECE_TO_PLANE.get(piece.symbol())
-        if plane is not None:
-            arr[r, c, plane] = 1.0
-    return arr.reshape(1, -1).astype(np.float32)
-
-def encode_onehot_vec(board: chess.Board) -> np.ndarray:
-    """
-    Returns (1, VOCAB_SIZE) vector where indices corresponding to moves in history are incremented.
-    Normalized to sum 1 if nonzero.
-    """
+def encode_onehot(board: chess.Board) -> np.ndarray:
     vec = np.zeros((1, VOCAB_SIZE), dtype=np.float32)
     for mv in [m.uci() for m in board.move_stack]:
         idx = MOVE2IDX.get(mv)
@@ -334,512 +213,293 @@ def encode_onehot_vec(board: chess.Board) -> np.ndarray:
         vec /= s
     return vec
 
-# ------------------------------
+# ----------------------------
 # Model inference wrapper
-# ------------------------------
-def normalize_probs(arr: np.ndarray) -> np.ndarray:
-    """Turn logits or scores into a probability vector."""
-    a = np.array(arr, dtype=np.float64).flatten()
-    if a.size == 0:
-        raise ValueError("empty model output")
-    # if already non-negative and sums approx 1, keep it
-    if (a >= 0).all() and abs(a.sum() - 1.0) < 1e-6:
-        return a
-    # use softmax
-    ex = np.exp(a - np.max(a))
-    return ex / (ex.sum() + 1e-12)
+# ----------------------------
+def softmax(x):
+    x = np.array(x, dtype=np.float64).flatten()
+    e = np.exp(x - np.max(x))
+    return e / (e.sum() + 1e-12)
 
-def infer_move_probs(board: chess.Board) -> np.ndarray:
-    """
-    Try to infer model output probabilities using sequence, planes, or one-hot encoders.
-    Returns a length-VOCAB_SIZE array summing to 1.
-    Raises on failure.
-    """
+def infer_probs(board: chess.Board):
+    """Attempt sequence -> model; fallback to planes -> model; final fallback onehot -> model"""
     if MODEL is None:
-        raise RuntimeError("No MODEL loaded")
-
-    errors = []
+        raise RuntimeError("No model loaded")
     # sequence
     try:
         seq = encode_sequence(board)
         out = MODEL.predict(seq, verbose=0)
-        raw = np.array(out[0]).flatten()
-        if raw.size == VOCAB_SIZE:
-            return normalize_probs(raw)
-        else:
-            errors.append(("seq_len_mismatch", raw.size))
+        arr = np.array(out[0]).flatten()
+        if arr.size == VOCAB_SIZE:
+            return softmax(arr)
     except Exception as e:
-        errors.append(("seq", str(e)))
-
+        log("[infer] seq failed:", e)
     # planes
     try:
         planes = encode_planes(board)
         out = MODEL.predict(planes, verbose=0)
-        raw = np.array(out[0]).flatten()
-        if raw.size == VOCAB_SIZE:
-            return normalize_probs(raw)
-        else:
-            errors.append(("planes_len_mismatch", raw.size))
+        arr = np.array(out[0]).flatten()
+        if arr.size == VOCAB_SIZE:
+            return softmax(arr)
     except Exception as e:
-        errors.append(("planes", str(e)))
-
-    # one-hot
+        log("[infer] planes failed:", e)
+    # onehot
     try:
-        vec = encode_onehot_vec(board)
+        vec = encode_onehot(board)
         out = MODEL.predict(vec, verbose=0)
-        raw = np.array(out[0]).flatten()
-        if raw.size == VOCAB_SIZE:
-            return normalize_probs(raw)
-        else:
-            errors.append(("onehot_len_mismatch", raw.size))
+        arr = np.array(out[0]).flatten()
+        if arr.size == VOCAB_SIZE:
+            return softmax(arr)
     except Exception as e:
-        errors.append(("onehot", str(e)))
+        log("[infer] onehot failed:", e)
+    raise RuntimeError("Model inference did not produce a valid-size output")
 
-    log("[infer] failed encoders/len mismatches:", errors)
-    raise RuntimeError("model inference failed; see logs")
-
-# ------------------------------
-# Choose a legal move given probs
-# ------------------------------
-def softmax_with_temp(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
-    if temp <= 0:
-        temp = 1e-6
-    a = x / temp
-    a = a - np.max(a)
-    e = np.exp(a)
-    return e / (e.sum() + 1e-12)
-
-def choose_legal_move_from_probs(board: chess.Board, probs: np.ndarray, argmax: bool = ARGMAX, top_k: int = TOP_K, temp: float = TEMPERATURE) -> Optional[str]:
-    legal_moves = [m.uci() for m in board.legal_moves]
-    if not legal_moves:
-        return None
-
-    items = []
-    for mv in legal_moves:
-        idx = MOVE2IDX.get(mv)
-        if idx is None or idx < 0 or idx >= probs.size:
-            continue
-        items.append((mv, float(probs[idx]), idx))
-    if not items:
-        return None
-
-    items.sort(key=lambda x: -x[1])  # descending by score
-
-    ucis = [it[0] for it in items]
-    scores = np.array([it[1] for it in items], dtype=np.float64)
-    if argmax:
-        return ucis[0]
-
-    k = min(top_k, len(scores))
-    top_scores = scores[:k]
-    # interpret as logits if needed
-    if (top_scores < 0).any() or top_scores.sum() <= 1e-8:
-        logits = top_scores - np.max(top_scores)
-        p = np.exp(logits / (temp if temp > 0 else 1))
-        p = p / (p.sum() + 1e-12)
-    else:
-        p = softmax_with_temp(top_scores, temp)
-    try:
-        idx_choice = np.random.choice(range(k), p=p)
-    except Exception:
-        idx_choice = 0
-    return ucis[idx_choice]
-
-# ------------------------------
-# Statistical imitation fallback
-# ------------------------------
-def get_board_phase(board: chess.Board) -> str:
-    """Simple heuristic: opening/midgame/endgame based on number of pieces."""
-    pieces = len(board.piece_map())
-    if pieces >= 26:
-        return "opening"
-    elif pieces >= 12:
-        return "midgame"
-    else:
-        return "endgame"
-
-def sample_weighted_imitation(board: chess.Board) -> Tuple[str, Dict[str, Any]]:
-    """
-    Sample a move based on move frequency in player's corpus, with some
-    board-phase bias and a tiny random exploration weight to avoid total determinism.
-    Returns (chosen_move_uci, thought_info)
-    """
+# ----------------------------
+# Choose legal move from prob vector
+# ----------------------------
+def choose_from_probs(board: chess.Board, probs: np.ndarray, argmax: bool = ARGMAX, top_k: int = TOP_K, temp: float = TEMP) -> Optional[str]:
     legal = [m.uci() for m in board.legal_moves]
     if not legal:
-        raise RuntimeError("No legal moves")
+        return None
+    items = []
+    for mv in legal:
+        idx = MOVE2IDX.get(mv)
+        if idx is None: continue
+        items.append((mv, float(probs[idx]), idx))
+    if not items: return None
+    items.sort(key=lambda x: -x[1])
+    if argmax:
+        return items[0][0]
+    k = min(top_k, len(items))
+    top_scores = np.array([it[1] for it in items[:k]])
+    # convert to probabilities with temperature
+    logits = top_scores / (temp if temp > 0 else 1e-6)
+    logits = logits - np.max(logits)
+    e = np.exp(logits)
+    p = e / (e.sum() + 1e-12)
+    choice = np.random.choice(range(k), p=p)
+    return items[choice][0]
 
-    phase = get_board_phase(board)
-    phase_bias = {"opening": 1.5, "midgame": 1.0, "endgame": 0.8}.get(phase, 1.0)
-
+# ----------------------------
+# Weighted imitation fallback
+# ----------------------------
+def weighted_imitation(board: chess.Board):
+    legal = [m.uci() for m in board.legal_moves]
+    phase = "opening" if len(board.move_stack) < 8 else ("endgame" if len(board.piece_map()) < 12 else "midgame")
+    bias = {"opening":1.5,"midgame":1.0,"endgame":0.8}[phase]
     weights = []
     for mv in legal:
         freq = MOVE_FREQ.get(mv, 0)
-        # base weight: freq+1 so unseen moves aren't zero
-        base = (freq + 1) ** phase_bias
-        # small random jitter to break ties
-        weight = base + random.random() * 0.01
-        weights.append(weight)
-
-    total = sum(weights)
-    probs = [w / total for w in weights]
-
+        weights.append((freq + 1)**bias + random.random()*1e-2)
+    s = sum(weights)
+    probs = [w/s for w in weights]
     chosen = random.choices(legal, weights=probs, k=1)[0]
-    thought = {
-        "method": "weighted-imitation",
-        "phase": phase,
-        "chosen": chosen,
-        "chosen_freq": MOVE_FREQ.get(chosen, 0),
-        "legal_known": sum(1 for mv in legal if MOVE_FREQ.get(mv, 0) > 0),
-        "probs_sampled_len": len(probs),
-    }
+    thought = {"method":"weighted_imitation", "phase":phase, "chosen_freq":MOVE_FREQ.get(chosen,0)}
     return chosen, thought
 
-# ------------------------------
-# Per-game handler
-# ------------------------------
-def handle_game(game_id: str, my_color: bool):
-    """
-    This function streams the game state via berserk and reacts to moves.
-    my_color: chess.WHITE (True) if the bot is white else chess.BLACK (False)
-    """
+# ----------------------------
+# Hybrid selection: pos_db + model + fallback
+# ----------------------------
+def hybrid_select(board: chess.Board, alpha: float = ALPHA):
+    # try pos_db
+    fen = board.fen()
+    pos_probs = get_pos_probs(fen)
+    model_probs = None
+    chosen = None
+    thought = None
+    if MODEL is not None:
+        try:
+            model_probs = infer_probs(board)
+        except Exception as e:
+            log("[hybrid] model inference failed:", e)
+            model_probs = None
+
+    # combine
+    if model_probs is not None and pos_probs is not None:
+        final = alpha * model_probs + (1 - alpha) * pos_probs
+    elif model_probs is not None:
+        final = model_probs
+    elif pos_probs is not None:
+        final = pos_probs
+    else:
+        final = None
+
+    if final is not None:
+        # normalize
+        final = final / (final.sum() + 1e-12)
+        if DEBUG_LOG_PROBS:
+            topk = np.argsort(final)[::-1][:8]
+            top_info = [(int(i), IDX2MOVE[i] if i < len(IDX2MOVE) else None, float(final[i])) for i in topk]
+            log("[hybrid] final top:", top_info)
+        chosen = choose_from_probs(board, final)
+        if chosen:
+            thought = {"method":"hybrid", "alpha":alpha}
+    if not chosen:
+        chosen, thought = weighted_imitation(board)
+    return chosen, thought
+
+# ----------------------------
+# Game handler
+# ----------------------------
+def handle_game(game_id: str, my_color_is_white: bool):
+    log(f"[{game_id}] handler started; my_color={'white' if my_color_is_white else 'black'}")
+    # create local berserk client for streaming
     try:
         local_session = berserk.TokenSession(LICHESS_TOKEN)
         local_client = berserk.Client(session=local_session)
     except Exception as e:
-        log("[handle_game] Failed to create berserk client:", e)
+        log("[handle_game] berserk client fail:", e)
         local_client = None
 
-    log(f"[{game_id}] handler start; my_color={'WHITE' if my_color else 'BLACK'}")
-
     board = chess.Board()
-    # initialize game meta
     with GAMES_LOCK:
-        GAMES[game_id] = {
-            "moves": [],
-            "white": None,
-            "black": None,
-            "last_thought": None,
-            "result": None,
-            "started_at": time.time(),
-            "updated_at": time.time(),
-        }
+        GAMES[game_id] = {"moves": [], "white": None, "black": None, "last_thought": None, "result": None}
 
-    # stream the game state
     try:
-        # stream_game_state yields gameFull and then updates
-        stream = local_client.bots.stream_game_state(game_id) if local_client else []
+        stream = local_client.bots.stream_game_state(game_id)
         for event in stream:
-            try:
-                etype = event.get("type")
-                if etype not in ("gameFull", "gameState"):
-                    continue
+            etype = event.get("type")
+            if etype not in ("gameFull", "gameState"):
+                continue
+            state = event.get("state", event)  # sometimes returned under top-level
+            moves_str = state.get("moves", "")
+            moves = moves_str.split() if moves_str else []
+            # rebuild board
+            board = chess.Board()
+            for m in moves:
+                try:
+                    board.push_uci(m)
+                except Exception:
+                    log(f"[{game_id}] failed to push historic move {m}")
 
-                state = event.get("state", event)
-                moves_str = state.get("moves", "")
-                moves = moves_str.split() if moves_str else []
-                # rebuild board
-                board = chess.Board()
-                for mv in moves:
-                    try:
-                        board.push_uci(mv)
-                    except Exception:
-                        # sometimes variants or odd SAN slip; we ignore bad moves
-                        log(f"[{game_id}] failed to push historic move {mv}")
+            # update meta
+            white_meta = state.get("white")
+            black_meta = state.get("black")
+            white_id = white_meta.get("id") if isinstance(white_meta, dict) else white_meta
+            black_id = black_meta.get("id") if isinstance(black_meta, dict) else black_meta
+            with GAMES_LOCK:
+                GAMES[game_id].update({"moves": moves, "white": white_id, "black": black_id})
 
-                # update metadata
-                white_meta = state.get("white")
-                black_meta = state.get("black")
-                white_id = None
-                black_id = None
-                if isinstance(white_meta, dict):
-                    white_id = white_meta.get("id") or white_meta.get("name")
-                if isinstance(black_meta, dict):
-                    black_id = black_meta.get("id") or black_meta.get("name")
-
+            status = state.get("status")
+            if status in ("mate","resign","timeout","stalemate","draw"):
+                winner = state.get("winner")
+                res = "1-0" if winner == "white" else ("0-1" if winner=="black" else "1/2-1/2")
                 with GAMES_LOCK:
-                    g = GAMES.get(game_id)
-                    if g:
-                        g["moves"] = moves
-                        g["white"] = white_id
-                        g["black"] = black_id
-                        g["updated_at"] = time.time()
+                    GAMES[game_id]["result"] = res
+                log(f"[{game_id}] finished: {res}")
+                break
 
-                # terminal state
-                status = state.get("status")
-                if status in ("mate", "resign", "timeout", "stalemate", "draw"):
-                    winner = state.get("winner")
-                    result = "1-0" if winner == "white" else ("0-1" if winner == "black" else "1/2-1/2")
-                    with GAMES_LOCK:
-                        GAMES[game_id]["result"] = result
-                    # save pgn
-                    try:
-                        save_game_pgn(game_id, white_id, black_id, moves, result)
-                    except Exception:
-                        pass
-                    log(f"[{game_id}] finished: {result}")
-                    break
-
-                # check turn: board.turn True means white to move
-                is_my_turn = (board.turn == my_color)
-
-                if is_my_turn and not board.is_game_over():
-                    log(f"[{game_id}] it's our turn. moves so far: {len(moves)}")
-                    # debug forced behaviors
-                    if DEBUG_FORCE_RANDOM:
-                        chosen = random.choice([m.uci() for m in board.legal_moves])
-                        thought = {"method": "debug-random"}
-                        log(f"[{game_id}] DEBUG_FORCE_RANDOM picked {chosen}")
-                    elif DEBUG_FORCE_OPENING:
-                        opening_list = DEBUG_FORCE_OPENING.strip().split()
-                        idx = len(moves)
-                        if idx < len(opening_list):
-                            cand = opening_list[idx]
-                            if cand in [m.uci() for m in board.legal_moves]:
-                                chosen = cand
-                                thought = {"method": "debug-opening", "chosen": chosen}
-                                log(f"[{game_id}] DEBUG_FORCE_OPENING playing {chosen}")
-                            else:
-                                # fall through to normal selection
-                                chosen = None
-                                thought = None
-                        else:
-                            chosen = None
-                            thought = None
-                    else:
-                        chosen = None
-                        thought = None
-
-                    # If we haven't chosen yet, prefer model inference if available
-                    if chosen is None:
-                        if MODEL is not None and VOCAB_SIZE > 0:
-                            try:
-                                probs = infer_move_probs(board)
-                                if DEBUG_LOG_PROBS:
-                                    topk = np.argsort(probs)[::-1][:16]
-                                    tops = [(int(i), IDX2MOVE[i] if i < len(IDX2MOVE) else None, float(probs[i])) for i in topk]
-                                    log(f"[{game_id}] model top predictions: {tops}")
-                                chosen = choose_legal_move_from_probs(board, probs, argmax=ARGMAX, top_k=TOP_K, temp=TEMPERATURE)
-                                thought = {"method": "model", "argmax": ARGMAX, "top_k": TOP_K}
-                                if chosen is None:
-                                    log(f"[{game_id}] model produced no legal-known moves; falling back to weighted imitation")
-                                    # fall back
-                                    chosen, thought = sample_weighted_imitation(board)
-                            except Exception as e:
-                                log(f"[{game_id}] model inference exception: {e}")
-                                traceback.print_exc()
-                                # fallback
-                                chosen, thought = sample_weighted_imitation(board)
-                        else:
-                            # no model — use weighted imitation
-                            chosen, thought = sample_weighted_imitation(board)
-
-                    # final safety: if chosen still None, pick a legal move
-                    if not chosen:
-                        legal = [m.uci() for m in board.legal_moves]
-                        chosen = random.choice(legal)
-                        thought = thought or {"method": "fallback-random"}
-
-                    # update thought + store + send move
-                    with GAMES_LOCK:
-                        GAMES[game_id]["last_thought"] = thought
-                        GAMES[game_id]["moves"] = moves + [chosen]
-                        GAMES[game_id]["updated_at"] = time.time()
-
-                    # send move with retry/backoff
-                    try:
-                        retry_call(local_client.bots.make_move, game_id, chosen)
-                        log(f"[{game_id}] played {chosen} (method={thought.get('method') if isinstance(thought, dict) else thought})")
-                    except Exception:
-                        log(f"[{game_id}] failed to send chosen move {chosen}; will try direct fallback")
-                        try:
-                            fallback = random.choice([m.uci() for m in board.legal_moves])
-                            retry_call(local_client.bots.make_move, game_id, fallback)
-                            log(f"[{game_id}] played fallback {fallback}")
-                        except Exception:
-                            log(f"[{game_id}] fallback also failed")
-
-                    # pacing delay
-                    time.sleep(MOVE_DELAY)
-
+            is_my_turn = (board.turn == my_color_is_white)
+            if is_my_turn and not board.is_game_over():
+                log(f"[{game_id}] our turn; moves={len(moves)}")
+                if DEBUG_FORCE_RANDOM:
+                    chosen = random.choice([m.uci() for m in board.legal_moves])
+                    thought = {"method":"debug-random"}
                 else:
-                    # not our turn; continue waiting
+                    try:
+                        chosen, thought = hybrid_select(board, ALPHA)
+                    except Exception as e:
+                        log(f"[{game_id}] hybrid_select failed: {e}")
+                        traceback.print_exc()
+                        chosen, thought = weighted_imitation(board)
+
+                # final safety: ensure legal
+                if chosen not in [m.uci() for m in board.legal_moves]:
+                    log(f"[{game_id}] chosen not legal -> fallback")
+                    chosen, thought = weighted_imitation(board)
+
+                # play move
+                try:
+                    local_client.bots.make_move(game_id, chosen)
+                    log(f"[{game_id}] played {chosen} ; thought={thought}")
+                except Exception as e:
+                    log(f"[{game_id}] make_move failed: {e}")
+                    traceback.print_exc()
+                # update local board & store
+                try:
+                    board.push_uci(chosen)
+                    with GAMES_LOCK:
+                        GAMES[game_id]["moves"].append(chosen)
+                        GAMES[game_id]["last_thought"] = thought
+                except Exception:
                     pass
 
-            except Exception:
-                log(f"[{game_id}] exception while processing event")
-                traceback.print_exc()
-
     except Exception:
-        log(f"[{game_id}] game stream failed")
+        log(f"[{game_id}] game stream terminated with exception")
         traceback.print_exc()
     finally:
         log(f"[{game_id}] handler exiting")
 
-# ------------------------------
-# Utility: save game as PGN
-# ------------------------------
-def save_game_pgn(game_id: str, white: Optional[str], black: Optional[str], moves: List[str], result: Optional[str] = None) -> str:
-    try:
-        game = chess.pgn.Game()
-        game.headers["Event"] = "ImitationGame"
-        game.headers["Site"] = "Lichess"
-        game.headers["White"] = white or "white"
-        game.headers["Black"] = black or "black"
-        game.headers["Result"] = result or "*"
-        node = game
-        for uci in moves:
-            try:
-                mv = chess.Move.from_uci(uci)
-                node = node.add_variation(mv)
-            except Exception:
-                # skip unparseable move
-                pass
-        path = os.path.join(STORAGE_DIR, f"{game_id}.pgn")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(game))
-        log(f"[pgn] saved {path}")
-        return path
-    except Exception:
-        log("[pgn] save failed")
-        traceback.print_exc()
-        raise
-
-# ------------------------------
-# Incoming events loop (main)
-# ------------------------------
-def main_event_loop():
-    """
-    Streams incoming events (challenges & gameStart). Accepts standard/fromPosition challenges.
-    """
-    client = create_global_client()
+# ----------------------------
+# Events loop (accept challenges)
+# ----------------------------
+def start_events_loop():
+    global CLIENT
+    if not LICHESS_TOKEN:
+        log("[events] Lichess token not set; events loop will not start")
+        return
+    session = berserk.TokenSession(LICHESS_TOKEN)
+    CLIENT = berserk.Client(session=session)
     log("[events] starting incoming events stream")
-    for event in client.bots.stream_incoming_events():
+    for event in CLIENT.bots.stream_incoming_events():
         try:
             etype = event.get("type")
-            log("[events] incoming event type:", etype)
             if etype == "challenge":
-                chal = event.get("challenge", {})
-                cid = chal.get("id")
-                variant = chal.get("variant", {}).get("key")
-                log(f"[events] challenge id={cid} variant={variant}")
+                ch = event.get("challenge", {})
+                cid = ch.get("id")
+                variant = ch.get("variant", {}).get("key")
+                log("[events] challenge", cid, "variant", variant)
                 if variant in ("standard", "fromPosition"):
                     try:
-                        retry_call(client.bots.accept_challenge, cid)
-                        log(f"[events] accepted challenge {cid}")
-                    except Exception:
-                        log(f"[events] accept failed for {cid}")
-                        traceback.print_exc()
+                        CLIENT.bots.accept_challenge(cid)
+                        log("[events] accepted", cid)
+                    except Exception as e:
+                        log("[events] accept failed", e)
                 else:
                     try:
-                        retry_call(client.bots.decline_challenge, cid)
-                        log(f"[events] declined challenge {cid}")
-                    except Exception:
-                        log(f"[events] decline failed for {cid}")
-                        traceback.print_exc()
-
+                        CLIENT.bots.decline_challenge(cid)
+                        log("[events] declined nonstandard", cid)
+                    except Exception as e:
+                        log("[events] decline failed", e)
             elif etype == "gameStart":
                 gid = event.get("game", {}).get("id")
-                color_str = event.get("game", {}).get("color")
-                my_color = chess.WHITE if color_str == "white" else chess.BLACK
-                log(f"[events] gameStart id={gid} color={color_str}")
-                th = threading.Thread(target=handle_game, args=(gid, my_color), daemon=True)
-                with GAME_THREADS_LOCK:
-                    GAME_THREADS[gid] = th
-                th.start()
-
+                color = event.get("game", {}).get("color")
+                my_color = chess.WHITE if color == "white" else chess.BLACK
+                log("[events] gameStart", gid, "color", color)
+                t = threading.Thread(target=handle_game, args=(gid, my_color), daemon=True)
+                t.start()
         except Exception:
-            log("[events] exception in main event loop")
+            log("[events] exception in incoming loop")
             traceback.print_exc()
 
-# ------------------------------
-# Supervisor: restart event thread if it dies
-# ------------------------------
-def start_event_thread():
-    global _event_thread
-    with _event_thread_lock:
-        if _event_thread and _event_thread.is_alive():
-            log("[supervisor] event thread already running")
-            return
-        _stop_flag.clear()
-        def worker():
-            backoff = BACKOFF_BASE
-            while not _stop_flag.is_set():
-                try:
-                    create_global_client()
-                    main_event_loop()
-                    log("[supervisor] event stream ended; reconnecting after", backoff)
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2.0, BACKOFF_MAX)
-                except Exception:
-                    log("[supervisor] event thread exception; sleeping", backoff)
-                    traceback.print_exc()
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2.0, BACKOFF_MAX)
-        _event_thread = threading.Thread(target=worker, daemon=True)
-        _event_thread.start()
-        log("[supervisor] event thread started")
-
-def stop_event_thread():
-    _stop_flag.set()
-    with _event_thread_lock:
-        if _event_thread and _event_thread.is_alive():
-            _event_thread.join(timeout=2.0)
-            log("[supervisor] event thread stopped")
-
-# ------------------------------
-# Heartbeat monitor
-# ------------------------------
-def start_heartbeat_monitor():
-    def hb():
-        while True:
-            try:
-                alive = False
-                with _event_thread_lock:
-                    if _event_thread and _event_thread.is_alive():
-                        alive = True
-                if not alive:
-                    log("[heartbeat] event thread not alive, restarting")
-                    start_event_thread()
-                time.sleep(max(5, HEARTBEAT_TIMEOUT // 6))
-            except Exception:
-                traceback.print_exc()
-                time.sleep(5)
-    t = threading.Thread(target=hb, daemon=True)
-    t.start()
-
-# ------------------------------
-# Flask admin & dashboard
-# ------------------------------
+# ----------------------------
+# Flask dashboard & admin
+# ----------------------------
 app = Flask(__name__)
 
 INDEX_HTML = """
 <!doctype html>
 <html>
-<head>
-  <title>Imitation Bot Dashboard</title>
-  <style>
-    body { font-family: Arial, sans-serif; background: #0b0b0b; color: #e6f0ff; }
-    .game { border: 1px solid #37474f; padding: 10px; margin: 8px; border-radius: 6px; background: #071018; }
-    h1 { color: #8ee0a9; }
-    pre { white-space: pre-wrap; }
-  </style>
-  <meta http-equiv="refresh" content="5">
+<head><title>Imitation Bot Dashboard</title>
+<style>
+body{font-family:monospace;background:#0b1020;color:#dbe9ee;padding:12px}
+.game{border:1px solid #21313b;padding:10px;margin:8px;border-radius:6px}
+</style>
+<meta http-equiv="refresh" content="5">
 </head>
 <body>
-  <h1>Imitation Bot Dashboard</h1>
-  <p>Model loaded: {{ model_loaded }}, vocab size: {{ vocab_size }}, active games: {{ active_games }}</p>
-  {% for gid, g in games.items() %}
-  <div class="game">
-    <b>Game:</b> {{ gid }} <br/>
-    <b>White:</b> {{ g.white }}  <b>Black:</b> {{ g.black }} <br/>
-    <b>Moves ({{ g.moves|length }}):</b> <pre>{{ " ".join(g.moves) }}</pre>
-    <b>Last thought:</b> <pre>{{ g.last_thought }}</pre>
-    <b>Result:</b> {{ g.result }} <br/>
-    <form method="post" action="/admin/save/{{ gid }}">
-      <button type="submit">Save PGN</button>
-    </form>
-  </div>
-  {% endfor %}
+<h2>Imitation Bot Dashboard</h2>
+<p>Model loaded: {{ model_loaded }}, vocab_size: {{ vocab_size }}, pos_db: {{ pos_db_loaded }}</p>
+{% for gid, g in games.items() %}
+<div class="game">
+<b>Game:</b> {{ gid }}<br/>
+<b>White:</b> {{ g.white }} | <b>Black:</b> {{ g.black }}<br/>
+<b>Moves:</b> <pre>{{ " ".join(g.moves) }}</pre>
+<b>Last thought:</b> <pre>{{ g.last_thought }}</pre>
+<b>Result:</b> {{ g.result }}
+<form method="post" action="/admin/save/{{ gid }}"><button>Save PGN</button></form>
+</div>
+{% endfor %}
 </body>
 </html>
 """
@@ -847,27 +507,15 @@ INDEX_HTML = """
 @app.route("/")
 def index():
     with GAMES_LOCK:
-        summary = {gid: {
-            "moves": g.get("moves", []),
-            "last_thought": g.get("last_thought"),
-            "white": g.get("white"),
-            "black": g.get("black"),
-            "result": g.get("result")
-        } for gid, g in GAMES.items()}
-        active = len(GAMES)
-    return render_template_string(INDEX_HTML, games=summary, model_loaded=(MODEL is not None), vocab_size=VOCAB_SIZE, active_games=active)
-
-@app.route("/debug")
-def debug_json():
-    with GAMES_LOCK:
-        return jsonify(GAMES)
+        return render_template_string(INDEX_HTML, games=GAMES, model_loaded=(MODEL is not None), vocab_size=VOCAB_SIZE, pos_db_loaded=POS_DB_LOADED)
 
 @app.route("/admin/reload", methods=["POST"])
 def admin_reload():
     try:
-        load_vocab_npz(VOCAB_PATH)
-        load_keras_model(MODEL_PATH)
-        return jsonify({"status": "reloaded", "vocab_size": VOCAB_SIZE, "model_loaded": MODEL is not None})
+        load_vocab(VOCAB_PATH)
+        load_pos_db(POS_DB_PATH)
+        load_keras(MODEL_PATH)
+        return jsonify({"status":"reloaded","vocab_size":VOCAB_SIZE,"model":(MODEL is not None),"pos_db":POS_DB_LOADED})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -876,101 +524,86 @@ def admin_reload():
 def admin_stats():
     with GAMES_LOCK:
         active = len(GAMES)
-    return jsonify({"model_loaded": MODEL is not None, "vocab_size": VOCAB_SIZE, "active_games": active, "move_freq_sample": MOVE_FREQ.most_common(10)})
+    return jsonify({"model": MODEL is not None, "vocab_size": VOCAB_SIZE, "pos_db_loaded": POS_DB_LOADED, "active_games": active, "top_moves_sample": dict(Counter(MOVE2IDX).most_common()[:20])})
+
+@app.route("/admin/debug_explain", methods=["POST"])
+def admin_debug_explain():
+    """
+    Accept JSON: {"fen": "..."} and returns model top-8, pos_db top-8, final mix given ALPHA
+    """
+    data = request.get_json(force=True)
+    fen = data.get("fen")
+    if not fen:
+        return jsonify({"error": "provide fen"}), 400
+    board = chess.Board(fen)
+    res = {}
+    pos_probs = get_pos_probs(fen)
+    model_probs = None
+    try:
+        model_probs = infer_probs(board) if MODEL is not None else None
+    except Exception as e:
+        res["model_error"] = str(e)
+    if pos_probs is not None:
+        top = np.argsort(pos_probs)[::-1][:12]
+        res["pos_top"] = [(int(i), IDX2MOVE[i], float(pos_probs[i])) for i in top]
+    if model_probs is not None:
+        top = np.argsort(model_probs)[::-1][:12]
+        res["model_top"] = [(int(i), IDX2MOVE[i], float(model_probs[i])) for i in top]
+    if model_probs is not None or pos_probs is not None:
+        if model_probs is None:
+            final = pos_probs
+        elif pos_probs is None:
+            final = model_probs
+        else:
+            final = ALPHA * model_probs + (1 - ALPHA) * pos_probs
+        top = np.argsort(final)[::-1][:12]
+        res["final_top"] = [(int(i), IDX2MOVE[i], float(final[i])) for i in top]
+    return jsonify(res)
 
 @app.route("/admin/save/<game_id>", methods=["POST"])
 def admin_save(game_id):
     with GAMES_LOCK:
         g = GAMES.get(game_id)
         if not g:
-            return jsonify({"error": "game not found"}), 404
+            return jsonify({"error": "not found"}), 404
+        moves = g.get("moves", [])
         white = g.get("white")
         black = g.get("black")
-        moves = g.get("moves", [])
         result = g.get("result")
-    path = save_game_pgn(game_id, white, black, moves, result)
+    # build pgn
+    game = chess.pgn.Game()
+    game.headers["Event"] = "Saved"
+    game.headers["White"] = white or "white"
+    game.headers["Black"] = black or "black"
+    node = game
+    for u in moves:
+        try:
+            mv = chess.Move.from_uci(u)
+            node = node.add_variation(mv)
+        except Exception:
+            pass
+    outdir = "saved_games"
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f"{game_id}.pgn")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(game))
     return jsonify({"saved": path})
 
-@app.route("/pgn/<game_id>")
-def get_pgn(game_id):
-    path = os.path.join(STORAGE_DIR, f"{game_id}.pgn")
-    if not os.path.exists(path):
-        return jsonify({"error": "pgn not found"}), 404
-    return send_file(path, as_attachment=True, download_name=f"{game_id}.pgn")
-
-# ------------------------------
-# CLI helper: load a model/vocab from paths and report diagnostics
-# ------------------------------
-def diagnostic_model_check():
-    log("[diag] running quick model diagnostics")
-    try:
-        if VOCAB_SIZE == 0:
-            log("[diag] vocab not loaded or empty")
-        else:
-            log(f"[diag] vocab size: {VOCAB_SIZE}. sample: {IDX2MOVE[:20]}")
-    except Exception:
-        traceback.print_exc()
-
-    if MODEL is None:
-        log("[diag] model is not loaded")
-        return
-
-    try:
-        # test on starting position
-        board = chess.Board()
-        encs = []
-        try:
-            seq = encode_sequence(board)
-            encs.append(("sequence", seq))
-        except Exception:
-            pass
-        try:
-            planes = encode_planes(board)
-            encs.append(("planes", planes))
-        except Exception:
-            pass
-        try:
-            onehot = encode_onehot_vec(board)
-            encs.append(("onehot", onehot))
-        except Exception:
-            pass
-
-        for name, inp in encs:
-            try:
-                out = MODEL.predict(inp, verbose=0)
-                arr = np.array(out).flatten()
-                log(f"[diag] encoder {name} -> model output length = {arr.size}")
-                top = np.argsort(arr)[::-1][:20]
-                top_moves = [(int(i), IDX2MOVE[i] if i < len(IDX2MOVE) else None, float(arr[i])) for i in top]
-                log("[diag] top moves:", top_moves)
-                known = [IDX2MOVE[i] for i in top if i < len(IDX2MOVE) and IDX2MOVE[i] in [m.uci() for m in board.legal_moves]]
-                log("[diag] known legal in top20:", known)
-            except Exception:
-                log(f"[diag] model predict failed for encoder {name}")
-                traceback.print_exc()
-
-    except Exception:
-        log("[diag] model diagnostics failed")
-        traceback.print_exc()
-
-# ------------------------------
-# Boot and run
-# ------------------------------
+# ----------------------------
+# Boot sequence
+# ----------------------------
 def boot():
-    # ensure client
-    try:
-        create_global_client()
-    except Exception:
-        log("[boot] global client creation failed (retry will happen in thread)")
-
-    # diagnostic info
-    log("Booting imitation bot")
-    log("MODEL path:", MODEL_PATH, "MODEL loaded:", MODEL is not None, "VOCAB path:", VOCAB_PATH, "VOCAB size:", VOCAB_SIZE)
-    diagnostic_model_check()
-    start_event_thread()
-    start_heartbeat_monitor()
+    log("Booting imitation bot app")
+    load_vocab(VOCAB_PATH)
+    load_pos_db(POS_DB_PATH)
+    load_keras(MODEL_PATH)
+    # start event loop in separate thread
+    if LICHESS_TOKEN:
+        t = threading.Thread(target=start_events_loop, daemon=True)
+        t.start()
+    else:
+        log("No Lichess token; events loop disabled")
 
 if __name__ == "__main__":
     boot()
-    log("Starting Flask admin on port", PORT)
     app.run(host="0.0.0.0", port=PORT, threaded=True)
