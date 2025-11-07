@@ -1,8 +1,10 @@
+flask>=2.2
+berserk>=0.6.0
+python-chess>=1.999
+numpy
+gunicorn
+requests
+tqdm
+h5py
+# tensorflow pinned to a compatible version for your Render Python:
 tensorflow==2.20.0
-numpy>=2.1.0
-berserk==0.6.0
-python-chess==1.999
-Flask==2.3.2
-gunicorn==20.1.0
-requests==2.31.0
-tqdm==4.66.1
