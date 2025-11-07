@@ -1,171 +1,119 @@
-import os
-import time
-import json
-import random
-import threading
-import numpy as np
-import chess
 import berserk
+import chess
+import chess.pgn
+import chess.engine
+import chess.polyglot
+import numpy as np
 import tensorflow as tf
-from tensorflow import keras
-from flask import Flask, jsonify
+import io
+import time
+import threading
 
-# ===============================
-# CONFIGURATION
-# ===============================
-MODEL_PATH = "./model.h5"
-VOCAB_PATH = "./vocab.npz"
-SEQ_LEN = 48  # should match training
-TOKEN = os.environ.get("Lichess_token")  # Set in Render secrets
-THINK_DELAY = 1.2  # seconds to simulate "thinking"
+# =========================
+# CONFIG
+# =========================
+LICHESS_TOKEN = "YOUR_LICHESS_TOKEN_HERE"  # replace
+MODEL_PATH = "model.h5"
+VOCAB_PATH = "vocab.npz"
+MAX_LEN = 48  # same as model training seq length
 
-# ===============================
-# LOAD MODEL & VOCAB
-# ===============================
-print("🔁 Loading imitation model and vocab...")
+# =========================
+# LOAD MODEL + VOCAB
+# =========================
+print("Loading model and vocab...")
+model = tf.keras.models.load_model(MODEL_PATH)
+vocab = np.load(VOCAB_PATH, allow_pickle=True)
+token_to_id = vocab["token_to_id"].item()
+id_to_token = vocab["id_to_token"].item()
+print("Loaded model ✅")
 
-try:
-    model = keras.models.load_model(MODEL_PATH)
-    print(f"✅ Model loaded from {MODEL_PATH}")
-except Exception as e:
-    raise RuntimeError(f"❌ Failed to load model: {e}")
-
-try:
-    vocab_data = np.load(VOCAB_PATH, allow_pickle=True)
-    moves_vocab = vocab_data["moves"]
-    move_to_idx = {m: i for i, m in enumerate(moves_vocab)}
-    idx_to_move = {i: m for i, m in enumerate(moves_vocab)}
-    print(f"✅ Loaded vocab with {len(moves_vocab)} moves")
-except Exception as e:
-    raise RuntimeError(f"❌ Failed to load vocab: {e}")
-
-# ===============================
-# LICHESS CLIENT
-# ===============================
-if not TOKEN:
-    raise EnvironmentError("❌ Missing Lichess_token environment variable!")
-
-session = berserk.TokenSession(TOKEN)
+# =========================
+# CONNECT TO LICHESS
+# =========================
+session = berserk.TokenSession(LICHESS_TOKEN)
 client = berserk.Client(session=session)
-
-# ===============================
-# MOVE PREDICTION
-# ===============================
-def predict_next_move(board: chess.Board):
-    """Predict next move using the imitation model."""
-    moves = list(board.move_stack)
-    seq = [move_to_idx.get(m.uci(), 0) for m in moves[-SEQ_LEN:]]
-    seq = np.pad(seq, (SEQ_LEN - len(seq), 0))
-    seq = np.expand_dims(seq, axis=0)
-
-    # Model inference
-    preds = model.predict(seq, verbose=0)[0]
-    move_idx = np.argmax(preds)
-    move_uci = idx_to_move.get(move_idx, None)
-
-    if move_uci not in [m.uci() for m in board.legal_moves]:
-        legal = [m.uci() for m in board.legal_moves]
-        move_uci = random.choice(legal)
-        print(f"⚠️ Model suggested illegal move, picked random {move_uci}")
-    return move_uci
+print("Connected to Lichess ✅")
 
 
-# ===============================
-# GAME HANDLER
-# ===============================
-def handle_game(game_id, my_color):
-    """Streams a Lichess game and responds to moves."""
-    print(f"🎮 Handling game {game_id}")
+# =========================
+# TOKENIZER UTILITIES
+# =========================
+def encode_moves(moves):
+    tokens = []
+    for mv in moves[-MAX_LEN:]:
+        if mv in token_to_id:
+            tokens.append(token_to_id[mv])
+        else:
+            tokens.append(token_to_id.get("<UNK>", 0))
+    x = np.zeros((1, MAX_LEN))
+    x[0, -len(tokens):] = tokens
+    return x
+
+
+def predict_move(moves, board):
+    """Predict next move based on the current move sequence"""
+    x = encode_moves(moves)
+    preds = model.predict(x, verbose=0)[0]
+    token_id = np.argmax(preds)
+    move_uci = id_to_token.get(str(token_id))
+    if move_uci and chess.Move.from_uci(move_uci) in board.legal_moves:
+        return chess.Move.from_uci(move_uci)
+    else:
+        # fallback: random legal move
+        return np.random.choice(list(board.legal_moves))
+
+
+# =========================
+# GAME LOOP
+# =========================
+def play_game(game_id):
+    print(f"Starting game: {game_id}")
     board = chess.Board()
-    game_stream = client.bots.stream_game_state(game_id)
+    moves = []
+    stream = client.bots.stream_game_state(game_id)
 
-    for event in game_stream:
-        if event["type"] not in ["gameFull", "gameState"]:
-            continue
+    for event in stream:
+        if event["type"] == "gameFull":
+            print("Game started.")
+            if event["white"]["id"] == client.account.get()["id"]:
+                my_color = chess.WHITE
+            else:
+                my_color = chess.BLACK
 
-        state = event.get("state", event)
-        moves_str = state.get("moves", "")
-        moves = moves_str.split() if moves_str else []
-
-        board = chess.Board()
-        for mv in moves:
-            try:
+        elif event["type"] == "gameState":
+            state = event
+            moves_san = state["moves"].split()
+            board.reset()
+            for mv in moves_san:
                 board.push_uci(mv)
-            except Exception:
-                pass
+            moves = moves_san
 
-        if board.is_game_over():
-            print(f"🏁 Game {game_id} is over: {board.result()}")
+            if board.turn == my_color:
+                move = predict_move(moves, board)
+                client.bots.make_move(game_id, move.uci())
+                print(f"Played: {move}")
+        elif event["type"] == "chatLine":
+            print(f"Chat: {event['username']}: {event['text']}")
+        elif event["type"] == "gameFinish":
+            print("Game finished.")
             break
 
-        if (board.turn == chess.WHITE and my_color == chess.WHITE) or (
-            board.turn == chess.BLACK and my_color == chess.BLACK
-        ):
-            print(f"🤔 Predicting move for {game_id} ...")
-            move_uci = predict_next_move(board)
-            time.sleep(THINK_DELAY)
-            try:
-                client.bots.make_move(game_id, move_uci)
-                print(f"✅ Played move {move_uci}")
-            except Exception as e:
-                print(f"❌ Failed to make move: {e}")
-        else:
-            print(f"⏳ Waiting for opponent... ({len(moves)} moves played)")
 
-
-# ===============================
+# =========================
 # MAIN LOOP
-# ===============================
-def main_loop():
-    print("🚀 ImitationBot online and awaiting challenges...")
-    while True:
-        try:
-            for event in client.bots.stream_incoming_events():
-                if event["type"] == "challenge":
-                    variant = event["challenge"]["variant"]["key"]
-                    chal_id = event["challenge"]["id"]
-                    if variant in ["standard", "fromPosition"]:
-                        client.bots.accept_challenge(chal_id)
-                        print(f"✅ Accepted challenge {chal_id}")
-                    else:
-                        client.bots.decline_challenge(chal_id)
-                        print(f"❌ Declined non-standard challenge: {variant}")
-
-                elif event["type"] == "gameStart":
-                    game_id = event["game"]["id"]
-                    color_str = event["game"]["color"]
-                    my_color = chess.WHITE if color_str == "white" else chess.BLACK
-                    print(f"♟️ Game started {game_id} ({color_str})")
-                    threading.Thread(target=handle_game, args=(game_id, my_color), daemon=True).start()
-        except Exception as e:
-            print(f"⚠️ Stream error: {e}")
-            time.sleep(10)
-
-
-# ===============================
-# FLASK SERVER (RENDER KEEPALIVE)
-# ===============================
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "running",
-        "bot": "ImitationBot",
-        "model": os.path.basename(MODEL_PATH),
-        "vocab_size": len(moves_vocab),
-        "games": "handled in background"
-    })
-
-@app.route("/status")
-def status():
-    return jsonify({"alive": True, "timestamp": time.time()})
+# =========================
+def listen_forever():
+    print("Listening for events...")
+    for event in client.bots.stream_incoming_events():
+        if event["type"] == "challenge":
+            ch = event["challenge"]
+            if ch["variant"]["key"] == "standard":
+                client.bots.accept_challenge(ch["id"])
+                print(f"Accepted challenge from {ch['challenger']['name']}")
+        elif event["type"] == "gameStart":
+            game_id = event["game"]["id"]
+            threading.Thread(target=play_game, args=(game_id,)).start()
 
 
 if __name__ == "__main__":
-    # Background thread runs the Lichess listener
-    threading.Thread(target=main_loop, daemon=True).start()
-
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 Starting Flask keepalive on port {port}")
-    app.run(host="0.0.0.0", port=port)
+    listen_forever()
