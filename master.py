@@ -76,12 +76,12 @@ DEFAULT_EMBED_DIM = 192        # medium fidelity
 DEFAULT_FF_DIM = 256
 DEFAULT_HEADS = 3
 DEFAULT_BATCH = 256
-DEFAULT_EPOCHS = 3
+DEFAULT_EPOCHS = 1024
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_TOP_K = 5
 FINE_TUNE_INTERVAL = 60 * 5    # seconds between incremental fine-tune runs (5 minutes)
 FINE_TUNE_BATCH = 32
-FINE_TUNE_EPOCHS = 1
+FINE_TUNE_EPOCHS = 256
 MODEL_SAVE_INTERVAL = 60 * 2   # autosave model every 2 minutes if updated
 SAMPLES_PER_FINE_TUNE = 2000   # cap of collected samples to fine-tune on in one run
 
