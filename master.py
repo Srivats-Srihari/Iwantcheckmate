@@ -1,780 +1,653 @@
 #!/usr/bin/env python3
 """
-iwcm_master_render.py
-Combined trainer + Lichess bot + live fine-tune + Flask dashboard.
+master.py
 
-Usage examples (local / Colab / Render):
-  # Train from folder:
-  python iwcm_master_render.py --prepare --pgn_dir ./pgns
-  python iwcm_master_render.py --train --epochs 3 --batch 256
+No-TensorFlow, high-fidelity imitation bot for Lichess.
 
-  # Run bot + server (Render):
-  export LICHESS_TOKEN="your_bot_token"
-  python iwcm_master_render.py --serve --bot
+Features:
+- Uses hybrid model (FEN -> move counts + N-gram context counts + unigram)
+- Incremental online training from PGNs and live completed games
+- Lichess bot integration using berserk (accepts standard/fromPosition challenges)
+- Simple Flask dashboard showing active games & last 'thoughts'
+- Periodic snapshots to disk; lightweight format (NPZ and PGNs)
+- Backoff smoothing (absolute-discount style) and temperature/argmax options
+- Robust to 429/401 errors and reconnects
 
-  # Or run everything (not recommended on Render, train in Colab first):
-  python iwcm_master_render.py --train --pgn_dir ./pgns --epochs 2 --bot --serve
+Important: This file contains your token as provided. Keep it secret. Do not share publicly.
 
-Files this script uses/produces:
-  - model.h5
-  - vocab.npz (keys: moves, token_to_id, id_to_token)
-  - optional: pgns.zip or pgns/ folder
+Dependencies:
+  pip install numpy python-chess berserk flask
+
+Run examples:
+  # train from PGN directory:
+  python3 master.py --train --pgn_dir pgns --model model.npz --ngram 3
+
+  # run bot + serve dashboard (fills LICHESS_TOKEN from token variable below):
+  python3 master.py --bot --serve --model model.npz --port 10000 --temp 0.6
+
 """
-# NOTE: keep this file single-file for Render deployment convenience.
 
-import os
-import sys
-import time
-import io
-import zipfile
-import json
-import random
-import tempfile
-import threading
 import argparse
+import collections
+import json
+import logging
+import os
+import random
+import signal
+import sys
+import threading
+import time
 import traceback
-from collections import defaultdict, deque
-from typing import List, Dict, Tuple, Optional
+import zipfile
+from collections import Counter, defaultdict
+from io import StringIO
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-# Basic dependencies
 import numpy as np
 import chess
 import chess.pgn
+from flask import Flask, jsonify, render_template_string
 
-# Try TensorFlow imports; provide meaningful error if missing
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers
-except Exception as e:
-    tf = None
-    keras = None
-    layers = None
-    print("WARNING: TensorFlow not available. Training & model loading will fail until TF is installed.", file=sys.stderr)
-
-# Try berserk for Lichess
+# Attempt to import berserk (Lichess API client)
 try:
     import berserk
 except Exception:
     berserk = None
-    print("WARNING: berserk not installed; bot features disabled until 'pip install berserk'.")
 
-# Flask for minimal dashboard
-try:
-    from flask import Flask, jsonify, render_template_string
-except Exception:
-    Flask = None
-    print("WARNING: Flask not installed; serve option will fail.")
+# --------------------- USER CONFIGURATION (EDIT CAREFULLY) -----------------
+# Your Lichess bot token (you provided it). Keep it secret. Consider setting
+# an environment variable instead of hardcoding in production.
+LICHESS_TOKEN = "lip_zu8iGjLJFwwPKmKwIXTk"
 
-# ================
-# CONFIG DEFAULTS
-# ================
-DEFAULT_MODEL = "model.h5"
-DEFAULT_VOCAB = "vocab.npz"
-DEFAULT_SEQ_LEN = 48           # context size for model
-DEFAULT_EMBED_DIM = 192        # medium fidelity
-DEFAULT_FF_DIM = 256
-DEFAULT_HEADS = 3
-DEFAULT_BATCH = 256
-DEFAULT_EPOCHS = 1024
-DEFAULT_LEARNING_RATE = 1e-4
-DEFAULT_TOP_K = 5
-FINE_TUNE_INTERVAL = 60 * 5    # seconds between incremental fine-tune runs (5 minutes)
-FINE_TUNE_BATCH = 32
-FINE_TUNE_EPOCHS = 256
-MODEL_SAVE_INTERVAL = 60 * 2   # autosave model every 2 minutes if updated
-SAMPLES_PER_FINE_TUNE = 2000   # cap of collected samples to fine-tune on in one run
+# Filenames
+DEFAULT_MODEL_PATH = "model.npz"   # model snapshot
+LIVE_PGN_DIR = "live_games"        # finished games exported from Lichess
+PGN_DIR = "pgns"                   # local training PGNs folder (optional)
+VOCAB_PATH = "vocab.npz"           # optional vocab file
 
-# Repro
-RANDOM_SEED = 1337
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
+# Performance / safety tuning
+DEFAULT_NGRAM = 3
+DEFAULT_DISCOUNT = 0.75
+SNAPSHOT_INTERVAL = 600  # seconds
+HEARTBEAT_TIMEOUT = 180  # if no events in this many seconds, reconnect
+MAX_RECONNECT_BACKOFF = 120
 
-# Global runtime state
-_live_game_samples_lock = threading.Lock()
-_live_game_samples: List[List[str]] = []  # list of move-sequence lists (UCI)
-_last_model_save = 0
-_model_dirty = False
+# Bot sampling defaults
+DEFAULT_TEMP = 0.6
+DEFAULT_ARGMAX = False
 
-# ================
-# UTILITIES
-# ================
-def safe_makedirs(path: str):
-    if path and not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+# Flask config
+FLASK_DEBUG = False
 
-def save_vocab_canonical(moves: List[str], token_to_id: Dict[str,int], id_to_token: Dict[int,str], path: str):
-    # Save using np.savez_compressed and include both dicts (pickled objects inside .npz)
-    safe_makedirs(os.path.dirname(path) or ".")
-    np.savez_compressed(path,
-                        moves=np.array(moves, dtype=object),
-                        token_to_id=token_to_id,
-                        id_to_token=id_to_token)
-    print(f"[vocab] Saved canonical vocab to {path} ({len(moves)} moves).")
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger("iwcm-master")
 
-def load_vocab_flexible(path: str):
+# ----------------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------------
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+def safe_load_npz(path: str):
     if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    data = np.load(path, allow_pickle=True)
-    keys = list(data.keys())
-    # Preferred names
-    moves = None
-    token_to_id = None
-    id_to_token = None
-    if "moves" in data:
-        moves = data["moves"].tolist()
-    if "token_to_id" in data:
-        token_to_id = data["token_to_id"].tolist() if isinstance(data["token_to_id"], np.ndarray) else data["token_to_id"]
-    if "id_to_token" in data:
-        id_to_token = data["id_to_token"].tolist() if isinstance(data["id_to_token"], np.ndarray) else data["id_to_token"]
-    # Fallback: first array-like
-    if moves is None:
-        for k in keys:
-            v = data[k]
-            if isinstance(v, np.ndarray) and v.dtype == object:
-                moves = list(v.tolist())
-                break
-    # Last fallback: maybe it's a dict-only save (older)
-    if token_to_id is None and moves is not None:
-        token_to_id = {m:i for i,m in enumerate(moves)}
-    if id_to_token is None and token_to_id is not None:
-        id_to_token = {i:m for m,i in token_to_id.items()}
-    if moves is None:
-        raise ValueError("Could not find moves array in vocab file")
-    print(f"[vocab] Loaded vocab from {path}: {len(moves)} moves.")
-    return moves, token_to_id, id_to_token
-
-# ================
-# PGN HANDLING
-# ================
-def extract_pgns_from_folder(folder: str, limit_games: Optional[int]=None) -> List[str]:
-    files = [os.path.join(folder,f) for f in os.listdir(folder) if f.lower().endswith(".pgn")]
-    texts = []
-    for fpath in sorted(files):
-        with open(fpath, "r", errors="ignore") as fh:
-            content = fh.read()
-        pgn_io = io.StringIO(content)
-        while True:
-            game = chess.pgn.read_game(pgn_io)
-            if game is None:
-                break
-            texts.append(str(game))
-            if limit_games and len(texts) >= limit_games:
-                return texts
-    print(f"[pgn] Extracted {len(texts)} games from folder {folder}")
-    return texts
-
-def extract_pgns_from_zip(zip_path: str, limit_games: Optional[int]=None) -> List[str]:
-    texts = []
-    with zipfile.ZipFile(zip_path, "r") as z:
-        for name in z.namelist():
-            if name.lower().endswith(".pgn"):
-                with z.open(name) as fh:
-                    try:
-                        t = fh.read().decode("utf-8", errors="ignore")
-                    except Exception:
-                        t = fh.read().decode("latin-1", errors="ignore")
-                pgn_io = io.StringIO(t)
-                while True:
-                    game = chess.pgn.read_game(pgn_io)
-                    if game is None:
-                        break
-                    texts.append(str(game))
-                    if limit_games and len(texts) >= limit_games:
-                        return texts
-    print(f"[pgn] Extracted {len(texts)} games from zip {zip_path}")
-    return texts
-
-def pgn_text_to_uci_sequence(pgn_text: str, max_moves: Optional[int]=None) -> List[str]:
-    pgn_io = io.StringIO(pgn_text)
-    try:
-        game = chess.pgn.read_game(pgn_io)
-    except Exception:
-        return []
-    if game is None:
-        return []
-    board = game.board()
-    seq = []
-    for move in game.mainline_moves():
-        try:
-            seq.append(move.uci())
-            board.push(move)
-        except Exception:
-            # skip problematic move
-            pass
-        if max_moves and len(seq) >= max_moves:
-            break
-    return seq
-
-def pgn_texts_to_uci_sequences(pgn_texts: List[str], max_moves: Optional[int]=None) -> List[List[str]]:
-    seqs = []
-    for t in pgn_texts:
-        seq = pgn_text_to_uci_sequence(t, max_moves)
-        if seq:
-            seqs.append(seq)
-    print(f"[pgn] Converted {len(seqs)} PGN texts to {len(seqs)} UCI sequences")
-    return seqs
-
-# ================
-# TOKENIZER
-# ================
-class MoveTokenizer:
-    def __init__(self):
-        self.token_to_id: Dict[str,int] = {}
-        self.id_to_token: Dict[int,str] = {}
-        self.moves: List[str] = []
-
-    def fit_on_sequences(self, sequences: List[List[str]], min_freq:int=1):
-        freq = defaultdict(int)
-        for seq in sequences:
-            for mv in seq:
-                freq[mv] += 1
-        moves_sorted = sorted([m for m,c in freq.items() if c >= min_freq],
-                              key=lambda m: (-freq[m], m))
-        # Map moves to ids starting at 1. Reserve 0 for PAD/UNK.
-        self.token_to_id = {m: i for i, m in enumerate(moves_sorted, start=1)}
-        self.id_to_token = {i: m for m, i in self.token_to_id.items()}
-        self.moves = moves_sorted
-        print(f"[tok] Built tokenizer: vocab_size={len(self.token_to_id)} (+PAD/UNK)")
-
-    def encode(self, seq: List[str], seq_len: int):
-        ids = [self.token_to_id.get(m, 0) for m in seq[-seq_len:]]
-        if len(ids) < seq_len:
-            ids = [0] * (seq_len - len(ids)) + ids
-        return np.array(ids, dtype=np.int32)
-
-    def save(self, path: str):
-        safe_makedirs(os.path.dirname(path) or ".")
-        save_vocab_canonical(self.moves, self.token_to_id, self.id_to_token, path)
-
-    @staticmethod
-    def load(path: str):
-        moves, t2i, i2t = load_vocab_flexible(path)
-        tok = MoveTokenizer()
-        tok.moves = moves
-        tok.token_to_id = t2i
-        tok.id_to_token = i2t
-        return tok
-
-# ================
-# MODEL (small transformer-ish)
-# ================
-def build_transformer_model(vocab_size:int, seq_len:int=DEFAULT_SEQ_LEN, embed_dim:int=DEFAULT_EMBED_DIM,
-                            num_heads:int=DEFAULT_HEADS, ff_dim:int=DEFAULT_FF_DIM, dropout=0.1):
-    if tf is None:
-        raise RuntimeError("TensorFlow not available; cannot build model.")
-    inputs = keras.Input(shape=(seq_len,), dtype="int32", name="moves_input")
-    x = layers.Embedding(input_dim=vocab_size + 1, output_dim=embed_dim, mask_zero=True, name="embed")(inputs)
-    # single attention block
-    att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim//num_heads, name="mha")(x, x)
-    x = layers.LayerNormalization(epsilon=1e-6, name="ln1")(x + att)
-    ff = layers.Dense(ff_dim, activation="relu", name="ff1")(x)
-    ff = layers.Dense(embed_dim, name="ff2")(ff)
-    x = layers.LayerNormalization(epsilon=1e-6, name="ln2")(x + ff)
-    x = layers.GlobalAveragePooling1D(name="pool")(x)
-    outputs = layers.Dense(vocab_size + 1, activation="softmax", name="out")(x)
-    model = keras.Model(inputs=inputs, outputs=outputs, name="chess_imitation")
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=DEFAULT_LEARNING_RATE),
-                  loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    return model
-
-# ================
-# DATASET CREATION
-# ================
-def sequences_to_xy(seqs: List[List[str]], tokenizer: MoveTokenizer, seq_len:int, max_samples:Optional[int]=None):
-    X = []
-    y = []
-    for seq in seqs:
-        ids = [tokenizer.token_to_id.get(m, 0) for m in seq]
-        for i in range(1, len(ids)):
-            left = ids[max(0, i - seq_len):i]
-            pad = [0] * (seq_len - len(left))
-            X.append(pad + left)
-            y.append(ids[i])
-            if max_samples and len(X) >= max_samples:
-                break
-        if max_samples and len(X) >= max_samples:
-            break
-    X = np.array(X, dtype=np.int32)
-    y = np.array(y, dtype=np.int32)
-    print(f"[data] Built X:{X.shape} y:{y.shape}")
-    return X, y
-
-# ================
-# TRAINER PIPELINE
-# ================
-def prepare_and_train(pgn_dir: Optional[str], pgn_zip: Optional[str], vocab_path: str, model_path: str,
-                      seq_len:int=DEFAULT_SEQ_LEN, epochs:int=DEFAULT_EPOCHS, batch_size:int=DEFAULT_BATCH,
-                      max_games:int=20000, quick:bool=False):
-    # 1) collect pgn texts
-    pgn_texts = []
-    if pgn_dir and os.path.exists(pgn_dir):
-        pgn_texts = extract_pgns_from_folder(pgn_dir, limit_games=max_games)
-    elif pgn_zip and os.path.exists(pgn_zip):
-        pgn_texts = extract_pgns_from_zip(pgn_zip, limit_games=max_games)
-    else:
-        raise RuntimeError("No PGNs found. Provide --pgn_dir or --pgn_zip")
-
-    # 2) convert to sequences
-    seqs = pgn_texts_to_uci_sequences(pgn_texts, max_moves=None)
-    if not seqs:
-        raise RuntimeError("No sequences extracted from provided PGNs.")
-
-    # quick mode sampling
-    if quick:
-        sample_n = min(500, len(seqs))
-        seqs = random.sample(seqs, sample_n)
-        print(f"[train] Quick mode: reduced to {len(seqs)} sequences")
-
-    # 3) build tokenizer & save vocab
-    tokenizer = MoveTokenizer()
-    tokenizer.fit_on_sequences(seqs, min_freq=1)
-    tokenizer.save(vocab_path)
-
-    # 4) dataset
-    X, y = sequences_to_xy(seqs, tokenizer, seq_len, max_samples=None)
-
-    # optionally subsample huge datasets for speed
-    max_samples = 200000
-    if X.shape[0] > max_samples:
-        idx = np.random.choice(X.shape[0], max_samples, replace=False)
-        X = X[idx]
-        y = y[idx]
-        print(f"[train] Subsampled to {X.shape[0]} training samples")
-
-    # 5) build model
-    model = build_transformer_model(vocab_size=len(tokenizer.token_to_id), seq_len=seq_len)
-    print(model.summary())
-
-    # 6) fit
-    model.fit(X, y, batch_size=batch_size, epochs=epochs, validation_split=0.05)
-
-    # 7) save model
-    model.save(model_path)
-    print(f"[train] Saved model to {model_path}")
-    return model, tokenizer
-
-# ================
-# UTILITY: encode history
-# ================
-def encode_history_for_inference(history: List[str], tokenizer: MoveTokenizer, seq_len:int):
-    ids = [tokenizer.token_to_id.get(m, 0) for m in history[-seq_len:]]
-    if len(ids) < seq_len:
-        ids = [0] * (seq_len - len(ids)) + ids
-    return np.array([ids], dtype=np.int32)
-
-# ================
-# PICK MOVE WITH MODEL
-# ================
-def pick_move_from_model(model: keras.Model, tokenizer: MoveTokenizer, board: chess.Board,
-                         history: List[str], temperature: float = 1.0, top_k: int = DEFAULT_TOP_K):
-    legal_moves = list(board.legal_moves)
-    if not legal_moves:
         return None
-    X = encode_history_for_inference(history, tokenizer, seq_len=DEFAULT_SEQ_LEN)
-    preds = model.predict(X, verbose=0)[0]  # vector length = vocab+1
-    # compute score per legal move
-    scores = []
-    legal_idx = []
-    for mv in legal_moves:
-        u = mv.uci()
-        idx = tokenizer.token_to_id.get(u, None)
-        if idx is None or idx >= preds.shape[0]:
-            s = 1e-12
-        else:
-            s = float(preds[idx])
-        scores.append(s)
-        legal_idx.append((mv, idx))
-    scores = np.array(scores, dtype=float)
-    if np.isnan(scores.sum()) or scores.sum() <= 0:
-        probs = np.ones_like(scores) / len(scores)
-    else:
-        logits = np.log(scores + 1e-12) / (temperature if temperature > 0 else 1.0)
-        exps = np.exp(logits - np.max(logits))
-        probs = exps / np.sum(exps)
-        if top_k and top_k < len(probs):
-            topk_positions = np.argsort(probs)[-top_k:]
-            mask = np.zeros_like(probs)
-            mask[topk_positions] = 1.0
-            probs = probs * mask
-            if probs.sum() <= 0:
-                probs = np.ones_like(probs) / len(probs)
-            else:
-                probs = probs / probs.sum()
-    choice = np.random.choice(len(legal_moves), p=probs)
-    return legal_moves[choice]
+    try:
+        data = np.load(path, allow_pickle=True)
+        return data
+    except Exception:
+        LOG.exception("Failed to load npz: %s", path)
+        return None
 
-# ================
-# LIVE FINE-TUNE LOOP
-# ================
-def collect_finished_game_for_finetune(move_seq: List[str]):
-    # Called by game handler when a game finishes (played by our bot); we push its move sequence to the buffer.
-    with _live_game_samples_lock:
-        _live_game_samples.append(move_seq.copy())
-        # cap buffer to avoid memory explosion
-        if len(_live_game_samples) > 10000:
-            _live_game_samples.pop(0)
-    print(f"[fine] Collected finished game for fine-tune, buffer size: {len(_live_game_samples)}")
 
-def fine_tune_worker(model_path: str, vocab_path: str, seq_len:int=DEFAULT_SEQ_LEN,
-                     interval:int=FINE_TUNE_INTERVAL, max_samples:int=SAMPLES_PER_FINE_TUNE):
-    global _model_dirty, _last_model_save
-    if tf is None:
-        print("[fine] TensorFlow not available; skipping fine-tune worker.")
-        return
-    print("[fine] Fine-tune worker started, checking buffer every", interval, "seconds")
-    while True:
-        time.sleep(interval)
-        with _live_game_samples_lock:
-            local_samples = list(_live_game_samples)
-            # After copying we clear global buffer (we will process them)
-            _live_game_samples.clear()
-        if not local_samples:
-            print("[fine] No new live games to fine-tune on.")
-            continue
-        # Load tokenizer and model
-        try:
-            tokenizer = MoveTokenizer.load(vocab_path)
-        except Exception as e:
-            print("[fine] Failed to load vocab for fine-tune:", e)
-            continue
-        try:
-            model = keras.models.load_model(model_path)
-        except Exception as e:
-            print("[fine] Failed to load model for fine-tune:", e)
-            continue
-        # Convert collected games to sequences and then to X,y
-        # Use up to max_samples combined from multiple games
-        seqs = local_samples
-        X_list = []
-        y_list = []
-        for seq in seqs:
-            ids = [tokenizer.token_to_id.get(m, 0) for m in seq]
-            for i in range(1, len(ids)):
-                left = ids[max(0, i - seq_len):i]
-                pad = [0] * (seq_len - len(left))
-                X_list.append(pad + left)
-                y_list.append(ids[i])
-                if len(X_list) >= max_samples:
-                    break
-            if len(X_list) >= max_samples:
+# ----------------------------------------------------------------------------
+# PGN parsing helpers
+# ----------------------------------------------------------------------------
+
+def iter_pgn_file(filepath: str):
+    """Yield chess.pgn.Game objects from a file with possibly many PGNs."""
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        while True:
+            try:
+                g = chess.pgn.read_game(f)
+            except Exception:
+                LOG.exception("Error reading PGN in %s", filepath)
                 break
-        if not X_list:
-            print("[fine] No usable samples extracted from live games.")
-            continue
-        X = np.array(X_list, dtype=np.int32)
-        y = np.array(y_list, dtype=np.int32)
-        print(f"[fine] Fine-tuning on {len(X)} samples (from {len(seqs)} games)")
-        try:
-            # tiny fine-tune: small lr, few epochs
-            model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5),
-                          loss="sparse_categorical_crossentropy")
-            model.fit(X, y, batch_size=FINE_TUNE_BATCH, epochs=FINE_TUNE_EPOCHS, verbose=1)
-            model.save(model_path)
-            _model_dirty = False
-            _last_model_save = time.time()
-            print("[fine] Fine-tune complete and model saved.")
-        except Exception as e:
-            print("[fine] Error during fine-tune:", e)
-            traceback.print_exc()
+            if g is None:
+                break
+            yield g
 
-# ================
-# LICHESS BOT
-# ================
-class ImitationLichessBot:
-    def __init__(self, token: str, model_path: str, vocab_path: str,
-                 seq_len:int=DEFAULT_SEQ_LEN, top_k:int=DEFAULT_TOP_K,
-                 temperature:float=1.0, accept_variants:Tuple[str,...]=("standard","fromPosition")):
+
+def pgn_moves_from_game(game: chess.pgn.Game) -> List[str]:
+    board = game.board()
+    moves = []
+    for mv in game.mainline_moves():
+        try:
+            moves.append(mv.uci())
+            board.push(mv)
+        except Exception:
+            # skip ill-formed move
+            LOG.debug("Skipping illegal move in PGN: %s", mv)
+            break
+    return moves
+
+
+def scan_pgn_dir(pgn_dir: str):
+    p = Path(pgn_dir)
+    if not p.exists():
+        LOG.warning("PGN dir not found: %s", pgn_dir)
+        return
+    for child in sorted(p.iterdir()):
+        if child.is_file() and child.suffix.lower() == ".pgn":
+            for g in iter_pgn_file(str(child)):
+                m = pgn_moves_from_game(g)
+                if m:
+                    yield m
+
+
+def scan_pgn_zip(zip_path: str):
+    if not os.path.exists(zip_path):
+        LOG.warning("PGN zip not found: %s", zip_path)
+        return
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in sorted(zf.namelist()):
+            if not name.lower().endswith(".pgn"):
+                continue
+            LOG.info("Reading PGN %s from zip", name)
+            raw = zf.read(name).decode("utf-8", errors="replace")
+            buf = StringIO(raw)
+            while True:
+                g = chess.pgn.read_game(buf)
+                if g is None:
+                    break
+                m = pgn_moves_from_game(g)
+                if m:
+                    yield m
+
+
+# ----------------------------------------------------------------------------
+# Hybrid imitation model (FEN counts + n-gram counts + unigram)
+# ----------------------------------------------------------------------------
+
+class HybridModel:
+    def __init__(self, n: int = DEFAULT_NGRAM, discount: float = DEFAULT_DISCOUNT):
+        self.n = int(n)
+        self.discount = float(discount)
+        self.context_counts: Dict[Tuple[str, ...], Counter] = defaultdict(Counter)
+        self.fen_counts: Dict[str, Counter] = defaultdict(Counter)
+        self.unigram: Counter = Counter()
+        self.total_unigrams = 0
+        self.games_trained = 0
+
+    # -- training --
+    def feed_game(self, moves: List[str]):
+        # update unigram and context counts
+        for i, mv in enumerate(moves):
+            self.unigram[mv] += 1
+            self.total_unigrams += 1
+            for k in range(1, self.n + 1):
+                if i - k < 0:
+                    break
+                ctx = tuple(moves[i - k : i])
+                self.context_counts[ctx][mv] += 1
+        # fen counts
+        board = chess.Board()
+        for mv in moves:
+            fen = self._reduce_fen(board.fen())
+            self.fen_counts[fen][mv] += 1
+            try:
+                board.push_uci(mv)
+            except Exception:
+                break
+        self.games_trained += 1
+
+    def train_from_iterator(self, it):
+        c = 0
+        for moves in it:
+            try:
+                self.feed_game(moves)
+                c += 1
+            except Exception:
+                LOG.exception("Error feeding game")
+        LOG.info("Trained on %d games (total games_trained=%d)", c, self.games_trained)
+        return c
+
+    # -- save/load --
+    def save(self, path: str):
+        LOG.info("Saving model to %s", path)
+        contexts = list(self.context_counts.keys())
+        counts = [dict(self.context_counts[c]) for c in contexts]
+        fen_keys = list(self.fen_counts.keys())
+        fen_counts = [dict(self.fen_counts[f]) for f in fen_keys]
+        np.savez_compressed(
+            path,
+            n=np.array([self.n]),
+            discount=np.array([self.discount]),
+            contexts=np.array(list(map(list, contexts)), dtype=object),
+            counts=np.array(counts, dtype=object),
+            fen_keys=np.array(fen_keys, dtype=object),
+            fen_counts=np.array(fen_counts, dtype=object),
+            unig_keys=np.array(list(self.unigram.keys()), dtype=object),
+            unig_vals=np.array(list(self.unigram.values()), dtype=object),
+            total_unigrams=np.array([self.total_unigrams]),
+            games_trained=np.array([self.games_trained]),
+        )
+
+    @classmethod
+    def load(cls, path: str):
+        raw = safe_load_npz(path)
+        if raw is None:
+            return None
+        n = int(raw.get("n", np.array([DEFAULT_NGRAM])).tolist()[0])
+        discount = float(raw.get("discount", np.array([DEFAULT_DISCOUNT])).tolist()[0])
+        model = cls(n=n, discount=discount)
+        contexts = raw["contexts"].tolist() if "contexts" in raw.files else []
+        counts = raw["counts"].tolist() if "counts" in raw.files else []
+        for ctx, cnt in zip(contexts, counts):
+            model.context_counts[tuple(ctx)].update(cnt)
+        fen_keys = raw.get("fen_keys", np.array([], dtype=object)).tolist() if "fen_keys" in raw.files else []
+        fen_counts = raw.get("fen_counts", np.array([], dtype=object)).tolist() if "fen_counts" in raw.files else []
+        for fk, fc in zip(fen_keys, fen_counts):
+            model.fen_counts[fk].update(fc)
+        unig_keys = raw.get("unig_keys", raw.get("unigram_keys", None))
+        if unig_keys is None:
+            # attempt fallback names
+            unig_keys = raw[raw.files[0]] if raw.files else []
+        # load unigram explicitly
+        if "unig_keys" in raw.files or "unigram_keys" in raw.files:
+            k = raw.get("unig_keys", raw.get("unigram_keys"))
+            v = raw.get("unig_vals", raw.get("unigram_vals"))
+            if k is not None and v is not None:
+                model.unigram.update(dict(zip(k.tolist(), v.tolist())))
+        elif "unig_keys" not in raw.files and "unigram_keys" not in raw.files:
+            # fallback: if there is no unigram, rebuild total_unigrams
+            model.total_unigrams = sum(model.unigram.values())
+        model.total_unigrams = int(raw.get("total_unigrams", np.array([sum(model.unigram.values())])).tolist()[0])
+        model.games_trained = int(raw.get("games_trained", np.array([0])).tolist()[0])
+        LOG.info("Loaded model %s: n=%d contexts=%d fen=%d unigrams=%d games=%d",
+                 path, model.n, len(model.context_counts), len(model.fen_counts), len(model.unigram), model.games_trained)
+        return model
+
+    # -- prediction & sampling --
+    def _reduce_fen(self, fen: str) -> str:
+        parts = fen.split()
+        if len(parts) >= 4:
+            return " ".join(parts[:4])
+        return fen
+
+    def predict_probs(self, history: List[str], legal_moves: List[str], board: Optional[chess.Board] = None) -> Dict[str, float]:
+        legal_moves = list(legal_moves)
+        if not legal_moves:
+            return {}
+        # FEN lookup first
+        if board is not None:
+            fen = self._reduce_fen(board.fen())
+            if fen in self.fen_counts:
+                cnts = self.fen_counts[fen]
+                total = sum(cnts.values())
+                if total > 0:
+                    probs = {m: max(cnts.get(m, 0) - self.discount, 0) / total for m in legal_moves}
+                    s = sum(probs.values())
+                    if s > 0:
+                        return {m: probs[m] / s for m in probs if probs[m] > 0}
+        # N-gram backoff
+        final = {m: 0.0 for m in legal_moves}
+        remaining = 1.0
+        for k in range(self.n, 0, -1):
+            if len(history) < k:
+                continue
+            ctx = tuple(history[-k:])
+            cnts = self.context_counts.get(ctx, None)
+            if not cnts:
+                continue
+            N = sum(cnts.values())
+            if N <= 0:
+                continue
+            unique = sum(1 for v in cnts.values() if v > 0)
+            # discounted probs
+            for m in legal_moves:
+                c = cnts.get(m, 0)
+                val = max(c - self.discount, 0.0) / N
+                if val > 0:
+                    final[m] += remaining * val
+            backoff_mass = (self.discount * unique) / N if N > 0 else 1.0
+            remaining *= backoff_mass
+        # unigram fallback
+        if remaining > 0:
+            total_u = self.total_unigrams if self.total_unigrams > 0 else sum(self.unigram.values())
+            if total_u > 0:
+                for m in legal_moves:
+                    final[m] += remaining * (self.unigram.get(m, 0) / total_u)
+            else:
+                for m in legal_moves:
+                    final[m] += remaining * (1.0 / len(legal_moves))
+        s = sum(final.values())
+        if s <= 0:
+            return {m: 1.0 / len(legal_moves) for m in legal_moves}
+        # filter zero and normalize
+        out = {m: final[m] / s for m in final if final[m] > 0}
+        # ensure all legal moves present (with tiny eps)
+        for m in legal_moves:
+            if m not in out:
+                out[m] = 1e-12
+        # renormalize
+        s2 = sum(out.values())
+        return {m: out[m] / s2 for m in out}
+
+    def sample(self, history: List[str], legal_moves: List[str], board: Optional[chess.Board] = None,
+               temperature: float = 1.0, argmax: bool = False) -> Tuple[str, Dict[str, float]]:
+        probs = self.predict_probs(history, legal_moves, board)
+        if not probs:
+            return random.choice(legal_moves), {}
+        if argmax:
+            mv = max(probs.items(), key=lambda kv: kv[1])[0]
+            return mv, probs
+        moves = list(probs.keys())
+        p = np.array([probs[m] for m in moves], dtype=np.float64)
+        if temperature != 1.0 and temperature > 0:
+            logits = np.log(p + 1e-12) / temperature
+            exps = np.exp(logits - logits.max())
+            p = exps / exps.sum()
+        p = p / p.sum()
+        mv = np.random.choice(moves, p=p)
+        return mv, dict(zip(moves, p.tolist()))
+
+
+# ----------------------------------------------------------------------------
+# Lichess bot orchestration
+# ----------------------------------------------------------------------------
+
+class LichessBot:
+    def __init__(self, token: str, model: HybridModel, temp: float = DEFAULT_TEMP, argmax: bool = DEFAULT_ARGMAX,
+                 snapshot_interval: int = SNAPSHOT_INTERVAL):
         if berserk is None:
-            raise RuntimeError("berserk is not installed; please pip install berserk to run bot.")
+            raise RuntimeError("berserk library not installed. run: pip install berserk")
         self.token = token
         self.session = berserk.TokenSession(token)
-        self.client = berserk.Client(session=self.session, timeout=90)
-        self.model_path = model_path
-        self.vocab_path = vocab_path
-        self.seq_len = seq_len
-        self.top_k = top_k
-        self.temperature = temperature
-        self.accept_variants = accept_variants
-        self.running = True
-        # load model & tokenizer
-        self._reload_model_and_tokenizer()
-        # stats
-        self.active_games = {}  # game_id -> dict (moves, last_thought,...)
-        self.threads = {}
+        self.client = berserk.Client(session=self.session)
+        self.model = model
+        self.temp = temp
+        self.argmax = argmax
+        self.snapshot_interval = snapshot_interval
+        self.active_games = {}  # game_id -> dict
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        ensure_dir(LIVE_PGN_DIR)
 
-    def _reload_model_and_tokenizer(self):
-        # Loads model and tokenizer; called on init and possibly periodically
-        if tf is None:
-            raise RuntimeError("TensorFlow not available; bot cannot load model.")
-        self.tokenizer = MoveTokenizer.load(self.vocab_path)
-        try:
-            self.model = keras.models.load_model(self.model_path)
-            print("[bot] Model loaded.")
-        except Exception as e:
-            print("[bot] Failed to load model:", e)
-            raise
+    def accept_or_decline(self, challenge: dict):
+        cid = challenge.get("id")
+        variant = challenge.get("variant", {}).get("key", "")
+        if variant in ("standard", "fromPosition"):
+            try:
+                LOG.info("Accepting challenge %s variant=%s", cid, variant)
+                self.client.bots.accept_challenge(cid)
+            except Exception:
+                LOG.exception("Failed to accept %s", cid)
+        else:
+            try:
+                LOG.info("Declining challenge %s variant=%s", cid, variant)
+                self.client.bots.decline_challenge(cid)
+            except Exception:
+                LOG.exception("Failed to decline %s", cid)
 
-    def _accept_or_decline(self, challenge):
-        vid = challenge["id"]
-        var = challenge["variant"]["key"]
-        try:
-            if var in self.accept_variants:
-                self.client.bots.accept_challenge(vid)
-                print(f"[bot] Accepted challenge {vid} variant={var}")
-            else:
-                self.client.bots.decline_challenge(vid)
-                print(f"[bot] Declined challenge {vid} variant={var}")
-        except Exception as e:
-            print("[bot] Error accepting/declining challenge:", e)
-
-    def _game_worker(self, game_id: str, my_color: chess.Color):
-        print(f"[bot] Game thread started for {game_id} color={'white' if my_color==chess.WHITE else 'black'}")
+    def handle_game(self, game_id: str, my_color: chess.Color):
+        LOG.info("[game %s] handler start color=%s", game_id, "white" if my_color else "black")
         board = chess.Board()
-        stream = None
         try:
             stream = self.client.bots.stream_game_state(game_id)
-            for event in stream:
-                try:
-                    if event["type"] in ("gameFull", "gameState"):
-                        state = event.get("state", event)
-                        moves_str = state.get("moves", "")
-                        moves = moves_str.split() if moves_str else []
-                        # rebuild board
-                        board = chess.Board()
-                        for mv in moves:
-                            try:
-                                board.push_uci(mv)
-                            except Exception:
-                                pass
-                        # update active metadata
-                        self.active_games[game_id] = {"moves": moves.copy(), "last_thought": None, "result": None}
-                        # if game over
-                        if board.is_game_over():
-                            res = state.get("status", "finished")
-                            self.active_games[game_id]["result"] = res
-                            print(f"[bot] Game {game_id} ended: {res}")
-                            # collect finished game for fine-tune
-                            collect_finished_game_for_finetune(moves.copy())
-                            break
-                        # our turn?
-                        if board.turn == my_color:
-                            # reload model occasionally to pick up incremental fine-tune
-                            try:
-                                # lightweight: reload model from disk if file changed (cheapish)
-                                self.model = keras.models.load_model(self.model_path)
-                            except Exception:
-                                pass
-                            print(f"[bot:{game_id}] Thinking... moves played: {len(moves)}")
-                            mv = pick_move_from_model(self.model, self.tokenizer, board, moves,
-                                                      temperature=self.temperature, top_k=self.top_k)
-                            if mv is None:
-                                print(f"[bot:{game_id}] No legal move (game over?)")
-                                break
-                            try:
-                                self.client.bots.make_move(game_id, mv.uci())
-                                print(f"[bot:{game_id}] Played {mv.uci()}")
-                            except Exception as e:
-                                print(f"[bot:{game_id}] Failed to make move: {e}")
-                                # fallback: random legal
-                                try:
-                                    legal = list(board.legal_moves)
-                                    if legal:
-                                        fallback = next(iter(legal))
-                                        self.client.bots.make_move(game_id, fallback.uci())
-                                        print(f"[bot:{game_id}] Fallback played {fallback.uci()}")
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    print(f"[bot:{game_id}] Error processing event: {e}")
-        except Exception as e:
-            print(f"[bot:{game_id}] Stream error: {e}")
-        finally:
-            # stream ended or game finished
+        except Exception:
+            LOG.exception("Failed to stream game state %s", game_id)
+            return
+        for event in stream:
             try:
-                collect_finished_game_for_finetune(self.active_games.get(game_id, {}).get("moves", []))
+                if event.get("type") in ("gameFull", "gameState"):
+                    state = event.get("state", event)
+                    moves_s = state.get("moves", "")
+                    moves = moves_s.split() if moves_s else []
+                    board = chess.Board()
+                    for mv in moves:
+                        try:
+                            board.push_uci(mv)
+                        except Exception:
+                            LOG.debug("Illegal move in stream %s: %s", game_id, mv)
+                    with self.lock:
+                        self.active_games.setdefault(game_id, {"moves": [], "last_thought": None, "white": None, "black": None, "result": None})
+                        self.active_games[game_id]["moves"] = moves[:]  # copy
+                    if not board.is_game_over() and board.turn == my_color:
+                        legal = [m.uci() for m in board.legal_moves]
+                        choice, probs = self.model.sample(moves, legal, board=board, temperature=self.temp, argmax=self.argmax)
+                        LOG.info("[game %s] Playing %s (legal %d)", game_id, choice, len(legal))
+                        with self.lock:
+                            self.active_games[game_id]["last_thought"] = {"choice": choice, "probs": probs}
+                        try:
+                            self.client.bots.make_move(game_id, choice)
+                        except Exception:
+                            LOG.exception("Failed to make move %s in game %s", choice, game_id)
+                    else:
+                        LOG.debug("[game %s] Not our turn or game over", game_id)
+                elif event.get("type") == "gameFinish":
+                    LOG.info("[game %s] finished %s", game_id, event)
+                    # try export PGN
+                    try:
+                        pgn_text = self.client.games.export(game_id)
+                        save_path = os.path.join(LIVE_PGN_DIR, f"{game_id}.pgn")
+                        with open(save_path, "w", encoding="utf-8") as fh:
+                            fh.write(pgn_text)
+                        LOG.info("Exported finished PGN to %s", save_path)
+                    except Exception:
+                        LOG.exception("Failed to export pgn for %s", game_id)
+                    # update model with moves we kept
+                    with self.lock:
+                        moves = self.active_games.get(game_id, {}).get("moves", [])[:]
+                    if moves:
+                        try:
+                            self.model.feed_game(moves)
+                            LOG.info("Online trained with finished game %s (moves=%d)", game_id, len(moves))
+                        except Exception:
+                            LOG.exception("Failed to update model with finished game %s", game_id)
+                # store other metadata if present
             except Exception:
-                pass
-            print(f"[bot] Game thread exiting for {game_id}")
-            # cleanup
-            if game_id in self.active_games:
-                del self.active_games[game_id]
+                LOG.exception("Exception in game handler loop for %s", game_id)
+            if self._stop.is_set():
+                LOG.info("Stopping handler for %s due to stop flag", game_id)
+                break
 
-    def run_event_loop(self):
-        print("[bot] Starting incoming events stream")
-        backoff = 1.0
-        while self.running:
+    def incoming_loop(self):
+        backoff = 1
+        while not self._stop.is_set():
             try:
+                LOG.info("Opening incoming events stream")
                 for event in self.client.bots.stream_incoming_events():
-                    if event["type"] == "challenge":
-                        self._accept_or_decline(event["challenge"])
-                    elif event["type"] == "gameStart":
-                        game_id = event["game"]["id"]
-                        color_str = event["game"]["color"]
-                        my_color = chess.WHITE if color_str == "white" else chess.BLACK
-                        th = threading.Thread(target=self._game_worker, args=(game_id, my_color), daemon=True)
-                        th.start()
-                        self.threads[game_id] = th
-                backoff = 1.0
-            except berserk.exceptions.ResponseError as re:
-                print("[bot] Lichess API response error:", re)
-                # handle 401, 429 etc
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-            except Exception as e:
-                print("[bot] Unexpected exception in event loop:", e)
-                traceback.print_exc()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                    if self._stop.is_set():
+                        break
+                    try:
+                        LOG.debug("Incoming event: %s", event.get("type"))
+                        if event.get("type") == "challenge":
+                            self.accept_or_decline(event["challenge"])
+                        elif event.get("type") == "gameStart":
+                            gid = event["game"]["id"]
+                            color = event["game"].get("color", "white")
+                            my_color = chess.WHITE if color == "white" else chess.BLACK
+                            t = threading.Thread(target=self.handle_game, args=(gid, my_color), daemon=True)
+                            t.start()
+                    except Exception:
+                        LOG.exception("Error processing incoming event")
+                # stream ended; reconnect
+                LOG.warning("Incoming events stream ended; reconnecting after %ds", backoff)
+            except berserk.exceptions.ResponseError as e:
+                LOG.exception("Berserk response error: %s", e)
+                # handle rate-limiting / unauthorized
+                try:
+                    status = getattr(e, 'status_code', None)
+                    LOG.info("ResponseError status: %s", status)
+                except Exception:
+                    pass
+            except Exception:
+                LOG.exception("Unexpected exception in incoming_loop")
+            # progressive backoff
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF)
+
+    def start(self):
+        self._stop.clear()
+        t = threading.Thread(target=self.incoming_loop, daemon=True)
+        t.start()
+        # snapshot thread
+        s = threading.Thread(target=self.snapshot_loop, daemon=True)
+        s.start()
 
     def stop(self):
-        self.running = False
+        self._stop.set()
 
-# ================
-# FLASK DASHBOARD for Render
-# ================
-def run_flask_app(bot_obj: Optional[ImitationLichessBot], port:int=10000):
-    if Flask is None:
-        raise RuntimeError("Flask not installed.")
-    app = Flask("iwcm_dashboard")
-    @app.route("/")
-    def home():
-        return render_template_string("""
-        <h1>Imitation Bot Dashboard</h1>
-        <p>Status: <strong>Running</strong></p>
-        <p>Model: {{model}}</p>
-        <p>Vocab size: {{vsize}}</p>
-        <p>Active games: <span id="active">loading...</span></p>
-        <pre id="dump"></pre>
-        <script>
-          async function poll(){
-            const res = await fetch('/status');
-            const j = await res.json();
-            document.getElementById('active').innerText = Object.keys(j).length;
-            document.getElementById('dump').innerText = JSON.stringify(j, null, 2);
-          }
-          setInterval(poll, 2000);
-          poll();
-        </script>
-        """, model=os.path.basename(DEFAULT_MODEL), vsize="(loaded at startup)")
-    @app.route("/status")
-    def status():
-        if bot_obj:
-            return jsonify(bot_obj.active_games)
-        else:
-            return jsonify({})
-    print(f"[flask] Starting Flask on port {port}")
-    app.run(host="0.0.0.0", port=port, threaded=True)
-
-# ================
-# MAIN CLI
-# ================
-def main():
-    parser = argparse.ArgumentParser(description="Imitation Bot: train + serve + live fine-tune")
-    parser.add_argument("--pgn_dir", default="pgns", help="folder with .pgn files")
-    parser.add_argument("--pgn_zip", default="pgns.zip", help="zip of pgns (optional)")
-    parser.add_argument("--vocab", default=DEFAULT_VOCAB, help="vocab.npz")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="model.h5")
-    parser.add_argument("--seq_len", type=int, default=DEFAULT_SEQ_LEN)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
-    parser.add_argument("--train", action="store_true", help="train from PGNs")
-    parser.add_argument("--prepare", action="store_true", help="prepare vocab from PGNs")
-    parser.add_argument("--bot", action="store_true", help="run lichess bot")
-    parser.add_argument("--serve", action="store_true", help="run flask server (Render)")
-    parser.add_argument("--fine_tune_worker", action="store_true", help="run fine-tune worker (background)")
-    parser.add_argument("--quick", action="store_true", help="quick mode (small sample)")
-    args = parser.parse_args()
-
-    # Prep: unzip zip if present
-    if args.pgn_zip and os.path.exists(args.pgn_zip) and not os.path.exists(args.pgn_dir):
-        try:
-            print("[main] Extracting pgns.zip to pgns/")
-            safe_makedirs(args.pgn_dir)
-            with zipfile.ZipFile(args.pgn_zip, "r") as z:
-                z.extractall(args.pgn_dir)
-            print("[main] Extraction complete.")
-        except Exception as e:
-            print("[main] Could not extract zip:", e)
-
-    # Prepare only: build vocab
-    if args.prepare:
-        pgn_texts = []
-        if os.path.exists(args.pgn_dir):
-            pgn_texts = extract_pgns_from_folder(args.pgn_dir, limit_games=50000)
-        elif os.path.exists(args.pgn_zip):
-            pgn_texts = extract_pgns_from_zip(args.pgn_zip, limit_games=50000)
-        else:
-            print("[main] No PGNs found for --prepare.")
-            sys.exit(1)
-        seqs = pgn_texts_to_uci_sequences(pgn_texts)
-        tok = MoveTokenizer()
-        tok.fit_on_sequences(seqs)
-        tok.save(args.vocab)
-        print("[main] Vocab prepared and saved to", args.vocab)
-        # if only prepare requested, exit
-        if not args.train and not args.bot and not args.serve:
-            return
-
-    model_obj = None
-    tokenizer = None
-
-    # Train if requested (or if no model exists)
-    need_train = args.train or (not os.path.exists(args.model))
-    if need_train:
-        print("[main] Starting training pipeline...")
-        model_obj, tokenizer = prepare_and_train(pgn_dir=args.pgn_dir if os.path.exists(args.pgn_dir) else None,
-                                                 pgn_zip=args.pgn_zip if os.path.exists(args.pgn_zip) else None,
-                                                 vocab_path=args.vocab, model_path=args.model,
-                                                 seq_len=args.seq_len, epochs=args.epochs, batch_size=args.batch,
-                                                 quick=args.quick)
-    else:
-        # Load model & vocab
-        if tf is None:
-            print("[main] TensorFlow not available; cannot load existing model.")
-        else:
+    def snapshot_loop(self):
+        while not self._stop.is_set():
             try:
-                tokenizer = MoveTokenizer.load(args.vocab)
-                model_obj = keras.models.load_model(args.model)
-                print("[main] Loaded model and vocab.")
-            except Exception as e:
-                print("[main] Failed to load existing model/vocab:", e)
+                time.sleep(self.snapshot_interval)
+                self.model.save(DEFAULT_MODEL_PATH)
+                LOG.info("Snapshot saved to %s", DEFAULT_MODEL_PATH)
+            except Exception:
+                LOG.exception("Snapshot error")
 
-    # If bot requested, start bot thread
-    bot_obj = None
-    if args.bot:
-        token = os.environ.get("LICHESS_TOKEN") or os.environ.get("Lichess_token") or os.environ.get("LICHESS_API_TOKEN")
-        if not token:
-            print("[main] Missing LICHESS_TOKEN environment variable; bot cannot start.")
-        else:
-            bot_obj = ImitationLichessBot(token=token, model_path=args.model, vocab_path=args.vocab,
-                                          seq_len=args.seq_len)
-            bot_thread = threading.Thread(target=bot_obj.run_event_loop, daemon=True)
-            bot_thread.start()
-            print("[main] Bot event loop started in background.")
 
-    # Fine-tune worker (collects live games & periodically fine-tunes the model)
-    if args.fine_tune_worker:
-        if tf is None:
-            print("[main] TF not available; skipping fine-tune worker.")
-        else:
-            fine_thread = threading.Thread(target=fine_tune_worker, args=(args.model, args.vocab), daemon=True)
-            fine_thread.start()
-            print("[main] Fine-tune worker started in background.")
+# ----------------------------------------------------------------------------
+# Flask dashboard
+# ----------------------------------------------------------------------------
 
-    # Serve flask app (blocking)
-    if args.serve:
-        run_flask_app(bot_obj, port=int(os.environ.get("PORT", 10000)))
-    else:
-        # If not serving, keep main thread alive if bot/fine workers running
+APP = Flask(__name__)
+GLOBAL_BOT: Optional[LichessBot] = None
+
+DASH_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bot Dashboard</title>
+  <style>body{font-family:system-ui;margin:18px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px;text-align:left}</style>
+</head>
+<body>
+  <h1>IWantCheckmate — Bot Dashboard</h1>
+  <p>Active games (auto refresh every 3s)</p>
+  <div id="content"></div>
+  <script>
+    async function refresh(){
+      const r = await fetch('/_games');
+      const j = await r.json();
+      let html = '<table><tr><th>Game</th><th>White</th><th>Black</th><th>Moves</th><th>Last thought</th></tr>';
+      for(const id of Object.keys(j)){
+        const g = j[id];
+        html += `<tr><td>${id}</td><td>${g.white||''}</td><td>${g.black||''}</td><td style="font-family:monospace">${(g.moves||[]).join(' ')}</td><td style="font-family:monospace">${g.last_thought?JSON.stringify(g.last_thought):''}</td></tr>`;
+      }
+      html += '</table>';
+      document.getElementById('content').innerHTML = html;
+    }
+    setInterval(refresh,3000); refresh();
+  </script>
+</body>
+</html>
+"""
+
+
+@APP.route('/')
+def index():
+    return DASH_HTML
+
+
+@APP.route('/_games')
+def api_games():
+    if GLOBAL_BOT is None:
+        return jsonify({})
+    with GLOBAL_BOT.lock:
+        return jsonify(GLOBAL_BOT.active_games)
+
+
+# ----------------------------------------------------------------------------
+# CLI & main orchestration
+# ----------------------------------------------------------------------------
+
+
+def make_parser():
+    p = argparse.ArgumentParser(description="IWantCheckmate master no-TF bot")
+    p.add_argument('--train', action='store_true', help='Train model from PGNs')
+    p.add_argument('--pgn_dir', default=PGN_DIR, help='PGN directory for training')
+    p.add_argument('--pgn_zip', default='', help='PGN zip for training')
+    p.add_argument('--model', default=DEFAULT_MODEL_PATH, help='Model save/load path (.npz)')
+    p.add_argument('--ngram', type=int, default=DEFAULT_NGRAM)
+    p.add_argument('--discount', type=float, default=DEFAULT_DISCOUNT)
+    p.add_argument('--bot', action='store_true', help='Run as lichess bot')
+    p.add_argument('--serve', action='store_true', help='Start Flask dashboard')
+    p.add_argument('--port', type=int, default=10000)
+    p.add_argument('--temp', type=float, default=DEFAULT_TEMP)
+    p.add_argument('--argmax', action='store_true', help='Play deterministically')
+    p.add_argument('--snapshot', type=int, default=SNAPSHOT_INTERVAL)
+    return p
+
+
+def main(argv=None):
+    global GLOBAL_BOT
+    args = make_parser().parse_args(argv)
+    random.seed(1234)
+    np.random.seed(1234)
+
+    model = None
+    # try load model
+    if os.path.exists(args.model):
         try:
-            while True:
-                time.sleep(10)
-        except KeyboardInterrupt:
-            print("Interrupted; exiting.")
-            if bot_obj:
-                bot_obj.stop()
-            sys.exit(0)
+            model = HybridModel.load(args.model)
+        except Exception:
+            LOG.exception("Failed to load model %s", args.model)
+            model = None
+    # construct if missing
+    if model is None:
+        model = HybridModel(n=args.ngram, discount=args.discount)
 
-if __name__ == "__main__":
+    # TRAIN
+    if args.train:
+        LOG.info("Training model: n=%d discount=%.3f", args.ngram, args.discount)
+        cnt = 0
+        if args.pgn_dir and os.path.exists(args.pgn_dir):
+            cnt = model.train_from_iterator(scan_pgn_dir(args.pgn_dir))
+        elif args.pgn_zip and os.path.exists(args.pgn_zip):
+            cnt = model.train_from_iterator(scan_pgn_zip(args.pgn_zip))
+        else:
+            LOG.error("No PGNs found. Provide --pgn_dir or --pgn_zip")
+            sys.exit(1)
+        model.save(args.model)
+        LOG.info("Training finished, saved model to %s", args.model)
+
+    bot = None
+    # BOT
+    if args.bot:
+        token = os.environ.get('LICHESS_TOKEN') or LICHESS_TOKEN
+        if not token:
+            LOG.error('No LICHESS_TOKEN set; provide via env or edit file')
+            sys.exit(1)
+        bot = LichessBot(token, model, temp=args.temp, argmax=args.argmax, snapshot_interval=args.snapshot)
+        GLOBAL_BOT = bot
+        bot.start()
+
+    # FLASK
+    if args.serve:
+        # run flask in main thread
+        LOG.info('Starting Flask dashboard on port %d', args.port)
+        try:
+            APP.run(host='0.0.0.0', port=args.port, debug=FLASK_DEBUG, threaded=True)
+        except Exception:
+            LOG.exception('Flask failed')
+    else:
+        if bot:
+            try:
+                while True:
+                    time.sleep(5)
+            except KeyboardInterrupt:
+                LOG.info('Keyboard interrupt, shutting down')
+                bot.stop()
+                model.save(args.model)
+        else:
+            LOG.info('Nothing to do; use --train or --bot')
+
+
+if __name__ == '__main__':
     main()
