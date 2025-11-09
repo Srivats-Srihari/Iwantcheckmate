@@ -4,32 +4,23 @@ master.py
 
 No-TensorFlow imitation Lichess bot + trainer (single-file).
 
-Features:
-- Loads Lichess API token from environment variable LICHESS_TOKEN or from .env
-- Hybrid n-gram + FEN-count model (no TF/PyTorch) for imitation
-- Train from PGN directory or zip, incremental online training from finished games
-- Plays on Lichess via berserk library; accepts standard/fromPosition challenges
-- Flask dashboard showing active games and "last thought"
-- Periodic snapshotting of model to NPZ
-- Designed to run on Raspberry Pi or Render; avoids heavy ML frameworks
+Updates in this copy:
+ - Adds --epochs and --checkpoint for repeated training passes (useful for long runs on Pi)
+ - Checkpoint saves every N epochs
+ - Same hybrid n-gram + FEN-count model (no TF/PyTorch)
+ - Loads token from env or --token (do NOT commit token to git)
 
 Usage examples:
-  # Train from a pgns/ folder
-  python3 master.py --train --pgn_dir pgns --model model.npz --ngram 3
+  # Train for 2048 epochs (will checkpoint every 100 epochs by default)
+  python3 master.py --train --pgn_zip PGNs.zip --model model.npz --ngram 3 --epochs 2048 --checkpoint 100
 
   # Run as a bot + serve dashboard on port 10000 (reads token from env)
   export LICHESS_TOKEN="your_real_token_here"
   python3 master.py --bot --serve --port 10000 --model model.npz
 
-Notes:
-  - Do NOT commit your token to git. Use environment variables or platform secrets.
-  - For Render, set the environment variable LICHESS_TOKEN in the service settings.
-
 Dependencies:
   pip install numpy python-chess berserk flask python-dotenv
-
 """
-
 import argparse
 import collections
 import logging
@@ -72,7 +63,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 DEFAULT_MODEL_PATH = "model.npz"
 LIVE_PGN_DIR = "live_games"
 DEFAULT_PGN_DIR = "pgns"
-DEFAULT_PGN_ZIP = "pgns.zip"
+DEFAULT_PGN_ZIP = "PGNs.zip"
 DEFAULT_NGRAM = 3
 DEFAULT_DISCOUNT = 0.75
 SNAPSHOT_INTERVAL = 600  # seconds
@@ -87,7 +78,7 @@ DEFAULT_ARGMAX = False
 class HybridModel:
     """Simple hybrid n-gram + FEN-count model.
 
-    This stores:
+    Stores:
       - context_counts: mapping from tuple(previous moves) -> Counter(next_move)
       - fen_counts: mapping from reduced FEN -> Counter(next_move)
       - unigram counts
@@ -131,7 +122,7 @@ class HybridModel:
                     c += 1
             except Exception:
                 LOG.exception("Error while feeding game")
-        LOG.info("Trained on %d games (total %d)", c, self.games_trained)
+        LOG.info("Trained on %d games (cumulative %d)", c, self.games_trained)
         return c
 
     def _reduce_fen(self, fen: str) -> str:
@@ -432,10 +423,8 @@ class LichessBot:
                     except Exception:
                         LOG.exception("Error processing incoming event")
                 LOG.warning("Incoming stream ended; reconnecting after %ds", backoff)
-            except berserk.exceptions.ResponseError as e:
-                LOG.exception("Berserk ResponseError: %s", e)
-            except Exception:
-                LOG.exception("Unexpected exception in incoming_loop")
+            except Exception as e:
+                LOG.exception("Exception in incoming_loop: %s", e)
             time.sleep(backoff)
             backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF)
 
@@ -493,10 +482,10 @@ def api_games():
     with GLOBAL_BOT.lock:
         return jsonify(GLOBAL_BOT.active_games)
 
+
 # ---------------------------
 # CLI and orchestration
 # ---------------------------
-
 def make_parser():
     p = argparse.ArgumentParser(description='IWCM master no-TF bot')
     p.add_argument('--train', action='store_true', help='Train from PGNs')
@@ -512,8 +501,9 @@ def make_parser():
     p.add_argument('--argmax', action='store_true')
     p.add_argument('--snapshot', type=int, default=SNAPSHOT_INTERVAL)
     p.add_argument('--token', default=None, help='Optional: pass token directly (not recommended)')
+    p.add_argument('--epochs', type=int, default=1, help='Number of full-pass epochs over the PGN dataset')
+    p.add_argument('--checkpoint', type=int, default=100, help='Save model every N epochs')
     return p
-
 
 def train_from_sources(model: HybridModel, pgn_dir: str = None, pgn_zip: str = None):
     total = 0
@@ -522,7 +512,6 @@ def train_from_sources(model: HybridModel, pgn_dir: str = None, pgn_zip: str = N
     if pgn_zip and os.path.exists(pgn_zip):
         total += model.train_from_iterator(scan_pgn_zip(pgn_zip))
     return total
-
 
 def main(argv=None):
     global GLOBAL_BOT
@@ -538,10 +527,23 @@ def main(argv=None):
         model = HybridModel(n=args.ngram, discount=args.discount)
 
     if args.train:
-        LOG.info('Training requested')
-        cnt = train_from_sources(model, pgn_dir=args.pgn_dir, pgn_zip=args.pgn_zip)
-        LOG.info('Trained on %d new games', cnt)
-        model.save(args.model)
+        LOG.info('Training requested: epochs=%d', args.epochs)
+        for epoch in range(args.epochs):
+            LOG.info("Epoch %d/%d -- starting", epoch + 1, args.epochs)
+            cnt = train_from_sources(model, pgn_dir=args.pgn_dir, pgn_zip=args.pgn_zip)
+            LOG.info('Epoch %d done: trained on %d games (cumulative %d)', epoch + 1, cnt, model.games_trained)
+            if (epoch + 1) % args.checkpoint == 0:
+                try:
+                    model.save(args.model)
+                    LOG.info("Checkpoint saved at epoch %d to %s", epoch + 1, args.model)
+                except Exception:
+                    LOG.exception("Failed to save checkpoint at epoch %d", epoch + 1)
+        # final save after all epochs
+        try:
+            model.save(args.model)
+            LOG.info("Final model saved to %s", args.model)
+        except Exception:
+            LOG.exception("Failed to save final model")
 
     token = args.token or os.getenv('LICHESS_TOKEN')
     if args.bot and not token:
@@ -571,7 +573,6 @@ def main(argv=None):
                 model.save(args.model)
         else:
             LOG.info('Nothing to do; use --train or --bot')
-
 
 if __name__ == '__main__':
     main()
