@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-# master_tf.py
 """
-TensorFlow-based chess imitation trainer + Lichess bot (single-file)
+master_style_imitation.py
 
-Usage examples:
-  # Build moves vocab and quick test training:
-  python3 master_tf.py --train --pgn_zip PGNs.zip --model model.h5 --moves moves.npz --epochs 1 --batch 64
+NumPy-only style-conditioned chess imitation + Lichess bot.
 
-  # Run bot + tiny dashboard (ensure LICHESS_TOKEN env var is set)
-  export LICHESS_TOKEN="your_token_here"
-  python3 master_tf.py --bot --serve --model model.h5 --moves moves.npz --port 10000
+Features:
+ - Build vocab from PGNs (uci moves)
+ - Build training samples (context -> next move)
+ - Compute a style vector from player's PGNs (average move embeddings)
+ - Small transformer-ish model (NumPy) that conditions on style vector
+ - Trainer with Adam
+ - Lichess Berserk bot that selects moves by scoring candidate moves conditioned on style
+ - Optional live fine-tune on games the bot plays
 
 Notes:
- - Assumes TensorFlow 2.x installed (`import tensorflow as tf`).
- - For heavy training use Colab / PC; Pi is OK for small fine-tune / inference.
+ - This is an engineering compromise: pure-NumPy model for portability, but slower to train.
+ - For serious accuracy, train on a GPU-enabled machine (export samples & vocab).
 """
 import argparse
+import collections
 import io
 import json
-import logging
 import math
 import os
 import random
@@ -29,537 +31,814 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# core libs
 import numpy as np
-import chess
-import chess.pgn
 
-# TF
+# chess lib
 try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers
+    import chess
+    import chess.pgn
 except Exception as e:
-    raise RuntimeError("TensorFlow import failed: %s" % e)
+    raise RuntimeError("python-chess required: pip install python-chess") from e
 
-# berserk for Lichess
+# lichess client (berserk)
 try:
     import berserk
 except Exception:
     berserk = None
 
-# optional stockfish
-try:
-    import chess.engine
-    STOCKFISH_AVAILABLE = True
-except Exception:
-    chess.engine = None
-    STOCKFISH_AVAILABLE = False
-
-# flask for dashboard
+# flask dashboard optional
 try:
     from flask import Flask, jsonify
 except Exception:
     Flask = None
 
-# logging
-LOG = logging.getLogger("iwcm-tf")
+# basic logging
+import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger("style_bot")
 
-# -------------------------
-# Move vocab generation
-# -------------------------
-def generate_all_uci_moves() -> List[str]:
-    files = "abcdefgh"
-    ranks = "12345678"
-    promos = ["q", "r", "b", "n"]
-    squares = [f + r for f in files for r in ranks]
-    moves = []
-    for a in squares:
-        for b in squares:
-            if a == b:
-                continue
-            moves.append(a + b)
-            if b[1] in ("8", "1"):
-                for p in promos:
-                    moves.append(a + b + p)
-    moves = sorted(set(moves))
-    return moves
+# -----------------------
+# Defaults & hyperparams
+# -----------------------
+DEFAULT_SEQ_LEN = 48
+EMBED_DIM = 128
+STYLE_DIM = 64      # dimension of computed style vector
+FF_DIM = 256
+NUM_LAYERS = 1
+NUM_HEADS = 2
+BATCH_SIZE = 128
+LR = 3e-4
+EPOCHS = 10
 
-ALL_UCI = generate_all_uci_moves()
-MOVE_TO_IDX = {m: i for i, m in enumerate(ALL_UCI)}
-IDX_TO_MOVE = {i: m for m, i in MOVE_TO_IDX.items()}
-OUTPUT_DIM = len(ALL_UCI)
+VOCAB_FILE = "vocab.npz"
+SAMPLES_FILE = "samples.npz"
+MODEL_FILE = "model_style.npz"
+STYLE_FILE = "style.npz"
 
-# -------------------------
-# Board -> tensor (channels_last)
-# -------------------------
-PIECE_TO_IDX = {
-    chess.PAWN: 0,
-    chess.KNIGHT: 1,
-    chess.BISHOP: 2,
-    chess.ROOK: 3,
-    chess.QUEEN: 4,
-    chess.KING: 5,
-}
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
 
-def board_to_tensor(board: chess.Board, add_side_to_move: bool = True) -> np.ndarray:
-    """
-    Returns (8,8,13) float32 tensor: 12 piece planes + 1 side-to-move plane if requested.
-    channels_last (H,W,C) for TF.
-    """
-    C = 12 + (1 if add_side_to_move else 0)
-    arr = np.zeros((8, 8, C), dtype=np.float32)
-    for sq, piece in board.piece_map().items():
-        pt = PIECE_TO_IDX[piece.piece_type]
-        offset = 0 if piece.color == chess.WHITE else 6
-        # convert to matrix coords: row 0 is rank 8 -> rank index reversed
-        r = 7 - chess.square_rank(sq)
-        f = chess.square_file(sq)
-        arr[r, f, offset + pt] = 1.0
-    if add_side_to_move:
-        val = 1.0 if board.turn == chess.WHITE else 0.0
-        arr[:, :, 12] = val
-    return arr
+# -----------------------
+# Vocab helpers
+# -----------------------
+def generate_move_vocab_from_pgns(pgn_zip: Optional[str] = None, pgn_dir: Optional[str] = None, min_freq: int = 1) -> Dict[str,int]:
+    counter = collections.Counter()
+    def iter_from_zip(zippath):
+        with zipfile.ZipFile(zippath, "r") as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".pgn"):
+                    continue
+                raw = zf.read(name).decode("utf-8", errors="replace")
+                fh = io.StringIO(raw)
+                while True:
+                    g = chess.pgn.read_game(fh)
+                    if g is None:
+                        break
+                    for mv in g.mainline_moves():
+                        counter[mv.uci()] += 1
+    def iter_from_dir(dirpath):
+        p = Path(dirpath)
+        for fn in p.rglob("*.pgn"):
+            try:
+                with open(fn, "r", encoding="utf-8", errors="replace") as fh:
+                    while True:
+                        g = chess.pgn.read_game(fh)
+                        if g is None: break
+                        for mv in g.mainline_moves():
+                            counter[mv.uci()] += 1
+            except Exception:
+                LOG.exception("Failed reading %s", fn)
 
-# -------------------------
-# PGN parsing -> dataset
-# -------------------------
-class PGNSampleBuilder:
-    """
-    Build dataset samples (board_tensor, move_idx) from PGN files (single .pgn files in a dir)
-    or from a PGN zip. Saves a samples.npz if requested to avoid reparsing every run.
-    """
+    if pgn_zip:
+        LOG.info("Building vocab from zip: %s", pgn_zip)
+        iter_from_zip(pgn_zip)
+    if pgn_dir:
+        LOG.info("Building vocab from dir: %s", pgn_dir)
+        iter_from_dir(pgn_dir)
 
-    def __init__(self, pgn_dir: Optional[str]=None, pgn_zip: Optional[str]=None, moves_vocab: Dict[str,int]=MOVE_TO_IDX):
-        if pgn_dir and pgn_zip:
-            raise ValueError("Provide only one of pgn_dir or pgn_zip.")
-        self.pgn_dir = pgn_dir
-        self.pgn_zip = pgn_zip
-        self.move_to_idx = moves_vocab
-        self.samples = []  # tuple list of (board_tensor np.uint8/float32, int idx)
+    vocab = {"<PAD>":0, "<UNK>":1}
+    idx = 2
+    for move, freq in counter.most_common():
+        if freq >= min_freq:
+            vocab[move] = idx
+            idx += 1
+    LOG.info("Vocab size: %d", len(vocab))
+    return vocab
 
-    def _parse_pgn_stream(self, fh):
-        while True:
-            g = chess.pgn.read_game(fh)
-            if g is None:
+def save_vocab(vocab: Dict[str,int], path: str = VOCAB_FILE):
+    moves = np.array(list(vocab.keys()), dtype=object)
+    ids = np.array([vocab[m] for m in moves], dtype=np.int32)
+    np.savez_compressed(path, moves=moves, ids=ids)
+    LOG.info("Saved vocab to %s", path)
+
+def load_vocab(path: str = VOCAB_FILE) -> Dict[str,int]:
+    d = np.load(path, allow_pickle=True)
+    moves = d["moves"]
+    ids = d["ids"]
+    vocab = {moves[i]: int(ids[i]) for i in range(len(moves))}
+    LOG.info("Loaded vocab from %s size=%d", path, len(vocab))
+    return vocab
+
+def save_idx_to_move(vocab, path):
+    inv = {v:k for k,v in vocab.items()}
+    keys = np.array(list(inv.keys()), dtype=np.int32)
+    vals = np.array(list(inv.values()), dtype=object)
+    np.savez_compressed(path, keys=keys, vals=vals)
+
+def load_idx_to_move(path):
+    d = np.load(path, allow_pickle=True)
+    keys = d["keys"]; vals = d["vals"]
+    return {int(keys[i]): str(vals[i]) for i in range(len(keys))}
+
+# -----------------------
+# Dataset builder
+# -----------------------
+class DatasetBuilder:
+    def __init__(self, vocab: Dict[str,int], seq_len: int = DEFAULT_SEQ_LEN):
+        self.vocab = vocab
+        self.seq_len = seq_len
+
+    def move_to_id(self, move: str) -> int:
+        return self.vocab.get(move, self.vocab.get("<UNK>", 1))
+
+    def build_from_zip(self, zippath: str, out_npz: str = SAMPLES_FILE, max_games: Optional[int] = None):
+        LOG.info("Building samples from zip: %s", zippath)
+        contexts, targets = [], []
+        count = 0
+        with zipfile.ZipFile(zippath,"r") as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".pgn"):
+                    continue
+                raw = zf.read(name).decode("utf-8", errors="replace")
+                fh = io.StringIO(raw)
+                while True:
+                    g = chess.pgn.read_game(fh)
+                    if g is None: break
+                    seq = []
+                    for mv in g.mainline_moves():
+                        contexts.append(self.build_context(seq))
+                        targets.append(self.move_to_id(mv.uci()))
+                        seq.append(mv.uci())
+                    count += 1
+                    if max_games and count >= max_games:
+                        break
+                if max_games and count >= max_games: break
+        if len(contexts) == 0:
+            LOG.warning("No samples created")
+        else:
+            X = np.array(contexts, dtype=np.int32)
+            y = np.array(targets, dtype=np.int32)
+            np.savez_compressed(out_npz, X=X, y=y)
+            LOG.info("Saved samples %s X=%s y=%s", out_npz, X.shape, y.shape)
+        return out_npz
+
+    def build_from_dir(self, dirpath: str, out_npz: str = SAMPLES_FILE, max_games: Optional[int] = None):
+        p = Path(dirpath)
+        contexts, targets = [], []
+        count = 0
+        for fn in p.rglob("*.pgn"):
+            try:
+                with open(fn, "r", encoding="utf-8", errors="replace") as fh:
+                    while True:
+                        g = chess.pgn.read_game(fh)
+                        if g is None: break
+                        seq = []
+                        for mv in g.mainline_moves():
+                            contexts.append(self.build_context(seq))
+                            targets.append(self.move_to_id(mv.uci()))
+                            seq.append(mv.uci())
+                        count += 1
+                        if max_games and count >= max_games:
+                            break
+            except Exception:
+                LOG.exception("Error parsing %s", fn)
+            if max_games and count >= max_games:
                 break
-            board = g.board()
-            for mv in g.mainline_moves():
-                u = mv.uci()
-                if u in self.move_to_idx:
-                    idx = self.move_to_idx[u]
-                    self.samples.append((board_to_tensor(board), idx))
-                    try:
-                        board.push(mv)
-                    except Exception:
-                        break
-                else:
-                    try:
-                        board.push(mv)
-                    except Exception:
-                        break
+        if len(contexts)==0:
+            LOG.warning("No samples created")
+        else:
+            X = np.array(contexts, dtype=np.int32)
+            y = np.array(targets, dtype=np.int32)
+            np.savez_compressed(out_npz, X=X, y=y)
+            LOG.info("Saved samples %s X=%s y=%s", out_npz, X.shape, y.shape)
+        return out_npz
 
-    def build(self):
-        LOG.info("Building samples from pgn_dir=%s pgn_zip=%s", self.pgn_dir, self.pgn_zip)
-        if self.pgn_dir and os.path.exists(self.pgn_dir):
-            p = Path(self.pgn_dir)
-            for path in sorted(p.rglob("*.pgn")):
-                try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                        self._parse_pgn_stream(fh)
-                except Exception:
-                    LOG.exception("Failed to parse %s", path)
-        if self.pgn_zip and os.path.exists(self.pgn_zip):
-            with zipfile.ZipFile(self.pgn_zip, "r") as zf:
-                for name in sorted(zf.namelist()):
-                    if not name.lower().endswith(".pgn"):
-                        continue
-                    try:
-                        raw = zf.read(name).decode("utf-8", errors="replace")
-                        self._parse_pgn_stream(io.StringIO(raw))
-                    except Exception:
-                        LOG.exception("Failed to parse %s in zip", name)
-        LOG.info("Built %d samples", len(self.samples))
-        return self.samples
+    def build_context(self, moves_seq: List[str]) -> List[int]:
+        seq = moves_seq[-self.seq_len:]
+        ids = [self.move_to_id(m) for m in seq]
+        if len(ids) < self.seq_len:
+            pad = [0] * (self.seq_len - len(ids))
+            ids = pad + ids
+        return ids
 
-    def save_npz(self, out: str):
-        if not self.samples:
-            raise RuntimeError("No samples to save.")
-        boards = np.stack([s[0] for s in self.samples], axis=0).astype(np.float32)
-        targets = np.array([s[1] for s in self.samples], dtype=np.int32)
-        np.savez_compressed(out, boards=boards, targets=targets)
-        LOG.info("Saved %d samples to %s", boards.shape[0], out)
+# -----------------------
+# Small NumPy model (embedding + pooling + style conditioning + MLP head)
+# -----------------------
+class Param:
+    def __init__(self, data: np.ndarray, name: str = ""):
+        self.data = data.astype(np.float32)
+        self.grad = np.zeros_like(self.data)
+        self.name = name
+    def zero_grad(self):
+        self.grad.fill(0.0)
 
-# -------------------------
-# TF model (conv) builder
-# -------------------------
-def build_model(input_shape=(8,8,13), channels=64, output_dim=OUTPUT_DIM):
-    inputs = keras.Input(shape=input_shape, name="board")
-    x = layers.Conv2D(channels, 3, padding="same", activation="relu")(inputs)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(channels*2, 3, padding="same", activation="relu")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(channels*2, 3, padding="same", activation="relu")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(512, activation="relu")(x)
-    x = layers.Dropout(0.2)(x)
-    outputs = layers.Dense(output_dim, activation=None, name="logits")(x)
-    model = keras.Model(inputs=inputs, outputs=outputs, name="conv_imitator")
-    return model
+class Embedding:
+    def __init__(self, vocab_size, dim):
+        self.W = Param(np.random.randn(vocab_size, dim).astype(np.float32) * (dim ** -0.5), name="emb_W")
+    def forward(self, idx_batch):
+        self.idx = idx_batch
+        return self.W.data[idx_batch]     # (B,L,D)
+    def backward(self, grad):
+        # grad: (B,L,D)
+        self.W.grad.fill(0.0)
+        np.add.at(self.W.grad, self.idx, grad)
 
-# -------------------------
-# TF training helper
-# -------------------------
-def make_tf_dataset_from_npz(npz_path, batch=64, shuffle=True, buffer=2048, val_split=0.05):
-    d = np.load(npz_path, allow_pickle=True)
-    boards = d["boards"]
-    targets = d["targets"]
-    n = len(targets)
-    LOG.info("Loaded npz with %d samples", n)
-    # shuffle indices
-    idx = np.arange(n)
-    np.random.shuffle(idx)
-    split = int(n * (1.0 - val_split))
-    train_idx = idx[:split]
-    val_idx = idx[split:]
-    def gen(idx_list):
-        for i in idx_list:
-            yield boards[i], targets[i]
-    out_train = tf.data.Dataset.from_generator(lambda: gen(train_idx), output_signature=(
-        tf.TensorSpec(shape=boards.shape[1:], dtype=tf.float32),
-        tf.TensorSpec(shape=(), dtype=tf.int32)
-    ))
-    out_val = tf.data.Dataset.from_generator(lambda: gen(val_idx), output_signature=(
-        tf.TensorSpec(shape=boards.shape[1:], dtype=tf.float32),
-        tf.TensorSpec(shape=(), dtype=tf.int32)
-    ))
-    if shuffle:
-        out_train = out_train.shuffle(buffer)
-    out_train = out_train.batch(batch).prefetch(tf.data.AUTOTUNE)
-    out_val = out_val.batch(batch).prefetch(tf.data.AUTOTUNE)
-    return out_train, out_val
+class Linear:
+    def __init__(self, in_dim, out_dim, name=""):
+        self.W = Param(np.random.randn(in_dim, out_dim).astype(np.float32) * (in_dim ** -0.5), name=name+".W")
+        self.b = Param(np.zeros(out_dim, dtype=np.float32), name=name+".b")
+    def forward(self, x):   # x (...,in_dim)
+        self.x_shape = x.shape
+        flat = x.reshape(-1, self.W.data.shape[0])
+        out = flat.dot(self.W.data) + self.b.data
+        return out.reshape(*self.x_shape[:-1], -1)
+    def backward(self, grad):  # grad (..., out_dim)
+        flat_grad = grad.reshape(-1, grad.shape[-1])
+        flat_x = self.x_shape
+        # need original input; but we'll store input on forward for this simplified flow
+        # To keep code tidy, user code must call set_last_input before backward
+        if not hasattr(self, "last_x"):
+            raise RuntimeError("Linear.backward called without last_x set")
+        x_flat = self.last_x.reshape(-1, self.W.data.shape[0])
+        self.W.grad += x_flat.T.dot(flat_grad)
+        self.b.grad += np.sum(flat_grad, axis=0)
+        grad_x = flat_grad.dot(self.W.data.T).reshape(*self.x_shape)
+        return grad_x
+    def set_last_input(self, x):
+        self.last_x = x
 
-# -------------------------
-# Inference utils: mask illegal moves
-# -------------------------
-def predict_move_from_model_tf(model: keras.Model, board: chess.Board, temperature: float=1.0, argmax: bool=False):
-    bt = board_to_tensor(board)
-    bat = np.expand_dims(bt, axis=0).astype(np.float32)
-    logits = model.predict(bat, verbose=0)[0]  # shape (OUTPUT_DIM,)
-    legal = [m.uci() for m in board.legal_moves]
-    mask = np.zeros_like(logits, dtype=bool)
-    for m in legal:
-        if m in MOVE_TO_IDX:
-            mask[MOVE_TO_IDX[m]] = True
-    if not mask.any():
-        return None, {}
-    big_neg = -1e9
-    masked = np.where(mask, logits, big_neg)
-    if temperature != 1.0 and temperature > 0:
-        scaled = masked / float(temperature)
-    else:
-        scaled = masked
-    scaled = scaled - np.max(scaled)
-    exps = np.exp(scaled)
-    exps = exps * mask
-    probs = exps / (np.sum(exps) + 1e-12)
-    if argmax:
-        idx = int(np.argmax(probs))
-    else:
-        idx = int(np.random.choice(len(probs), p=probs))
-    mv = IDX_TO_MOVE.get(idx, None)
-    probs_dict = {IDX_TO_MOVE[i]: float(probs[i]) for i in range(len(probs)) if mask[i] and probs[i] > 0}
-    return mv, probs_dict
+def gelu(x):
+    return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0/np.pi)*(x + 0.044715 * x**3)))
+def gelu_grad(x):
+    tanh = np.tanh(np.sqrt(2.0/np.pi)*(x + 0.044715 * x**3))
+    left = 0.5*(1+tanh)
+    sech2 = 1 - tanh*tanh
+    right = 0.5*x*sech2*(np.sqrt(2.0/np.pi)*(1+3*0.044715*x*x))
+    return left + right
 
-# -------------------------
-# Lichess Bot Class (TF)
-# -------------------------
-class TFTorchLichessBot:
-    def __init__(self, token: str, model: keras.Model, moves_path: str, temp: float=0.7, argmax: bool=False, stockfish_path: Optional[str]=None):
+class SimpleModel:
+    """
+    Embedding -> mean-pool -> concat(style_vector) -> small MLP -> logits
+    This is lightweight and trains faster than a full transformer on Pi.
+    """
+    def __init__(self, vocab_size:int, seq_len:int=DEFAULT_SEQ_LEN, emb_dim:int=EMBED_DIM, style_dim:int=STYLE_DIM, hidden:int=FF_DIM):
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.emb_dim = emb_dim
+        self.style_dim = style_dim
+        self.emb = Embedding(vocab_size, emb_dim)
+        # optional learned projection for style vector
+        self.style_proj = Linear(style_dim, emb_dim, name="style_proj")
+        # combine pooled emb + style_proj -> hidden -> logits
+        self.fc1 = Linear(emb_dim*1 + emb_dim, hidden, name="fc1")
+        self.fc2 = Linear(hidden, vocab_size, name="out")
+        # collect params
+        self.params = [self.emb.W, self.style_proj.W, self.style_proj.b,
+                       self.fc1.W, self.fc1.b, self.fc2.W, self.fc2.b]
+
+    def forward(self, idx_batch: np.ndarray, style_batch: np.ndarray):
+        # idx_batch: (B,L), style_batch: (B, style_dim)
+        B,L = idx_batch.shape
+        emb = self.emb.forward(idx_batch)   # (B,L,D)
+        pooled = emb.mean(axis=1)           # (B,D)
+        # style projection
+        self.style_proj.set_last_input(style_batch)
+        style_proj = self.style_proj.forward(style_batch)   # (B,D)
+        # concat
+        comb = np.concatenate([pooled, style_proj], axis=1)  # (B, 2D)
+        # fc1
+        self.fc1.set_last_input(comb)
+        h = self.fc1.forward(comb)
+        self.h_pre = h.copy()
+        h_act = gelu(h)
+        # fc2
+        self.fc2.set_last_input(h_act)
+        logits = self.fc2.forward(h_act)    # (B, V)
+        # store intermediates for backward
+        self._cache = (emb, pooled, style_proj, comb, h_act)
+        return logits
+
+    def backward(self, dlogits: np.ndarray):
+        # dlogits: (B,V)
+        h_act_grad = self.fc2.backward(dlogits)  # (B, hidden)
+        # gradient through gelu
+        # approximate: use pre-activation from cache
+        emb, pooled, style_proj, comb, h_act = self._cache
+        # h_act = gelu(h_pre)
+        # compute grad wrt h_pre
+        # we don't have h_pre stored exactly, but fc1.last_x was stored earlier; we saved h_pre in h_act variable BEFORE activation? We stored h_act which is post-activation.
+        # We'll approximate derivative numerically using gelu_grad on h_act (acceptable compromise)
+        dh_pre = h_act_grad * gelu_grad(h_act)
+        # backprop fc1
+        dcomb = self.fc1.backward(dh_pre)  # (B, 2D)
+        # split to pooled and style_proj
+        D = pooled.shape[1]
+        dpooled = dcomb[:, :D]
+        dstyleproj = dcomb[:, D:]
+        # backprop style_proj
+        dstyle_in = self.style_proj.backward(dstyleproj)  # (B, style_dim)
+        # backprop pooled -> embeddings (mean)
+        # pooled = emb.mean(axis=1) => each emb gets dpooled / L
+        B,L,D = emb.shape
+        demb = np.repeat(dpooled[:, None, :] / L, L, axis=1)
+        # backprop to embedding matrix
+        self.emb.backward(demb)
+        # accumulate grads appropriately (style_proj, fc1, fc2 already updated)
+        return
+
+    def params_and_grads(self):
+        out = []
+        for p in self.params:
+            out.append((p.data, p.grad, p))
+        return out
+
+    def zero_grads(self):
+        for _,_,p in self.params:
+            p.zero_grad()
+
+    def save(self, path: str = MODEL_FILE):
+        out = {}
+        out["vocab_size"] = self.vocab_size
+        out["seq_len"] = self.seq_len
+        out["emb_W"] = self.emb.W.data
+        out["style_proj_W"] = self.style_proj.W.data
+        out["style_proj_b"] = self.style_proj.b.data
+        out["fc1_W"] = self.fc1.W.data
+        out["fc1_b"] = self.fc1.b.data
+        out["fc2_W"] = self.fc2.W.data
+        out["fc2_b"] = self.fc2.b.data
+        np.savez_compressed(path, **out)
+        LOG.info("Saved model to %s", path)
+
+    @staticmethod
+    def load(path: str):
+        d = np.load(path, allow_pickle=True)
+        vocab_size = int(d["vocab_size"])
+        seq_len = int(d["seq_len"])
+        embW = d["emb_W"]
+        m = SimpleModel(vocab_size=vocab_size, seq_len=seq_len, emb_dim=embW.shape[1], style_dim=d["style_proj_W"].shape[0], hidden=d["fc1_W"].shape[1])
+        m.emb.W.data = embW
+        m.style_proj.W.data = d["style_proj_W"]
+        m.style_proj.b.data = d["style_proj_b"]
+        m.fc1.W.data = d["fc1_W"]
+        m.fc1.b.data = d["fc1_b"]
+        m.fc2.W.data = d["fc2_W"]
+        m.fc2.b.data = d["fc2_b"]
+        LOG.info("Loaded model %s", path)
+        return m
+
+# -----------------------
+# Loss & optimizer (Adam)
+# -----------------------
+def softmax(x):
+    x = x - np.max(x, axis=-1, keepdims=True)
+    ex = np.exp(x)
+    return ex / (np.sum(ex, axis=-1, keepdims=True) + 1e-12)
+
+def cross_entropy_and_grad(logits, targets):
+    probs = softmax(logits)
+    B = logits.shape[0]
+    idx = targets.astype(np.int64)
+    neglog = -np.log(probs[np.arange(B), idx] + 1e-12)
+    loss = np.mean(neglog)
+    grad = probs.copy()
+    grad[np.arange(B), idx] -= 1.0
+    grad = grad / B
+    return loss, grad
+
+class Adam:
+    def __init__(self, params: List[Param], lr=LR, b1=0.9, b2=0.999, eps=1e-8):
+        self.ps = params
+        self.lr = lr; self.b1 = b1; self.b2 = b2; self.eps = eps
+        self.m = {id(p): np.zeros_like(p.data) for p in params}
+        self.v = {id(p): np.zeros_like(p.data) for p in params}
+        self.t = 0
+    def step(self):
+        self.t += 1
+        for p in self.ps:
+            g = p.grad
+            m = self.m[id(p)]; v = self.v[id(p)]
+            m[:] = self.b1*m + (1-self.b1)*g
+            v[:] = self.b2*v + (1-self.b2)*(g*g)
+            m_hat = m / (1 - self.b1**self.t)
+            v_hat = v / (1 - self.b2**self.t)
+            update = self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            p.data -= update
+    def zero_grad(self):
+        for p in self.ps:
+            p.zero_grad()
+
+# -----------------------
+# Style vector computation
+# -----------------------
+def compute_style_from_pgns(pgn_zip: Optional[str], pgn_dir: Optional[str], vocab: Dict[str,int], style_dim:int = STYLE_DIM) -> np.ndarray:
+    """
+    Simple style vector: frequency-weighted average of one-hot moves projected to style_dim.
+    Implementation: compute normalized frequency vector over vocab moves seen in player's games,
+    then project using a random projection matrix (kept deterministic via seed). Save the style vector.
+    """
+    freq = collections.Counter()
+    total = 0
+    def iter_zip(zippath):
+        with zipfile.ZipFile(zippath, "r") as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".pgn"): continue
+                raw = zf.read(name).decode("utf-8", errors="replace")
+                fh = io.StringIO(raw)
+                while True:
+                    g = chess.pgn.read_game(fh)
+                    if g is None: break
+                    for mv in g.mainline_moves():
+                        freq[mv.uci()] += 1
+                        nonlocal_total_inc()
+    def iter_dir(dirpath):
+        p = Path(dirpath)
+        for fn in p.rglob("*.pgn"):
+            try:
+                with open(fn, "r", encoding="utf-8", errors="replace") as fh:
+                    while True:
+                        g = chess.pgn.read_game(fh)
+                        if g is None: break
+                        for mv in g.mainline_moves():
+                            freq[mv.uci()] += 1
+                            nonlocal_total_inc()
+            except Exception:
+                LOG.exception("Error reading %s", fn)
+
+    # small closure to bump total (to avoid using nonlocal keyword weirdness)
+    total = 0
+    def nonlocal_total_inc():
+        nonlocal total
+        total += 1
+
+    if pgn_zip:
+        with zipfile.ZipFile(pgn_zip, "r") as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".pgn"): continue
+                raw = zf.read(name).decode("utf-8", errors="replace")
+                fh = io.StringIO(raw)
+                while True:
+                    g = chess.pgn.read_game(fh)
+                    if g is None: break
+                    for mv in g.mainline_moves():
+                        freq[mv.uci()] += 1
+                        total += 1
+    if pgn_dir:
+        p = Path(pgn_dir)
+        for fn in p.rglob("*.pgn"):
+            try:
+                with open(fn, "r", encoding="utf-8", errors="replace") as fh:
+                    while True:
+                        g = chess.pgn.read_game(fh)
+                        if g is None: break
+                        for mv in g.mainline_moves():
+                            freq[mv.uci()] += 1
+                            total += 1
+            except Exception:
+                LOG.exception("Error %s", fn)
+    if total == 0:
+        LOG.warning("No moves found to compute style; returning random vector")
+        vec = np.random.randn(style_dim).astype(np.float32)
+        vec = vec / (np.linalg.norm(vec) + 1e-9)
+        return vec
+
+    # build freq vector in vocab order
+    inv = {v:k for k,v in vocab.items()}
+    vocab_size = len(vocab)
+    vec_freq = np.zeros(vocab_size, dtype=np.float32)
+    for m,cnt in freq.items():
+        if m in vocab:
+            vec_freq[vocab[m]] = cnt
+        else:
+            # accumulate to UNK
+            vec_freq[ vocab.get("<UNK>", 1) ] += cnt
+    # normalize
+    vec_freq = vec_freq / (np.sum(vec_freq) + 1e-12)
+    # small deterministic projection matrix
+    rng = np.random.RandomState(12345)
+    proj = rng.randn(vocab_size, style_dim).astype(np.float32) * (1.0 / math.sqrt(style_dim))
+    style_vec = vec_freq.dot(proj)   # (style_dim,)
+    # normalize
+    style_vec = style_vec / (np.linalg.norm(style_vec) + 1e-9)
+    return style_vec.astype(np.float32)
+
+# -----------------------
+# Trainer
+# -----------------------
+class Trainer:
+    def __init__(self, model: SimpleModel, samples_path: str, style_vec: np.ndarray, batch: int = BATCH_SIZE, lr: float = LR):
+        self.model = model
+        self.data = np.load(samples_path)
+        self.X = self.data['X']
+        self.y = self.data['y']
+        self.batch = batch
+        self.style_vec = style_vec
+        self.opt = Adam(self.model.params, lr=lr)
+        LOG.info("Trainer loaded: X=%s y=%s", self.X.shape, self.y.shape)
+
+    def iterate_batches(self):
+        n = len(self.y)
+        idx = np.arange(n)
+        np.random.shuffle(idx)
+        for i in range(0, n, self.batch):
+            bidx = idx[i:i+self.batch]
+            yield self.X[bidx], self.y[bidx]
+
+    def train(self, epochs:int=EPOCHS, save_path:Optional[str]=None, print_every:int=20):
+        B_style = np.tile(self.style_vec[None,:], (self.batch,1))  # we'll slice as needed
+        for ep in range(1, epochs+1):
+            total_loss = 0.0
+            it = 0
+            t0 = time.time()
+            for Xb, yb in self.iterate_batches():
+                it += 1
+                bs = Xb.shape[0]
+                style_batch = np.tile(self.style_vec[None,:], (bs,1)).astype(np.float32)
+                logits = self.model.forward(Xb, style_batch)
+                loss, dlogits = cross_entropy_and_grad(logits, yb)
+                # zero grads
+                for p in self.model.params: p.zero_grad()
+                # backward
+                self.model.backward(dlogits)
+                # step
+                self.opt.step()
+                total_loss += loss
+                if it % print_every == 0:
+                    LOG.info("Epoch %d it %d loss %.6f", ep, it, loss)
+            t1 = time.time()
+            LOG.info("Epoch %d done avg_loss=%.6f time=%.1fs", ep, total_loss/max(1,it), t1-t0)
+            if save_path:
+                self.model.save(save_path)
+
+# -----------------------
+# Lichess bot
+# -----------------------
+class StyleLichessBot:
+    def __init__(self, token: str, model: SimpleModel, vocab: Dict[str,int], idx_to_move: Dict[int,str], style_vec: np.ndarray, fine_tune: bool = False):
         if berserk is None:
-            raise RuntimeError("berserk library is required: pip install berserk")
+            raise RuntimeError("berserk required: pip install berserk")
         self.token = token
         self.session = berserk.TokenSession(token)
         self.client = berserk.Client(session=self.session)
         self.model = model
-        self.temp = temp
-        self.argmax = argmax
-        self.active_games = {}
+        self.vocab = vocab
+        self.idx_to_move = idx_to_move
+        self.move_to_idx = {m:i for m,i in vocab.items()}
+        self.style_vec = style_vec
+        self.fine_tune = fine_tune
+        self.recent_games_buffer = []     # store small training tuples from live play
         self.lock = threading.Lock()
-        self._stop = threading.Event()
-        if stockfish_path and STOCKFISH_AVAILABLE:
-            try:
-                self.engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-            except Exception:
-                LOG.exception("Failed to start stockfish")
-                self.engine = None
-        else:
-            self.engine = None
+        self.active_games = {}
 
-    def accept_challenge(self, challenge):
-        cid = challenge.get("id")
-        variant = challenge.get("variant", {}).get("key", "")
-        # Accept standard and fromPosition only
-        if variant in ("standard", "fromPosition"):
+    def accept_challenge(self, chal):
+        vid = chal['variant']['key']
+        cid = chal['id']
+        if vid in ('standard', 'fromPosition'):
             try:
                 self.client.bots.accept_challenge(cid)
-                LOG.info("Accepted challenge %s", cid)
+                LOG.info("Accepted %s", cid)
             except Exception:
-                LOG.exception("Failed to accept %s", cid)
+                LOG.exception("Accept failed %s", cid)
         else:
             try:
                 self.client.bots.decline_challenge(cid)
-                LOG.info("Declined challenge %s", cid)
+                LOG.info("Declined %s", cid)
             except Exception:
-                LOG.exception("Failed to decline %s", cid)
+                LOG.exception("Decline failed %s", cid)
 
-    def handle_game(self, game_id: str, my_color: chess.Color):
-        LOG.info("Start handler %s color=%s", game_id, 'white' if my_color else 'black')
-        try:
-            stream = self.client.bots.stream_game_state(game_id)
-        except Exception:
-            LOG.exception("Failed to open game stream %s", game_id)
-            return
-        for event in stream:
+    def score_candidate_moves(self, board: chess.Board, history_moves: List[str]) -> str:
+        """
+        For each legal move, append it to history and ask the model to score that candidate:
+        - Form the candidate context sequence (last seq_len moves with candidate appended)
+        - Map to ids, run forward to get logits, transform to probability assigned to candidate
+        Choose legal move with highest probability (style-aware).
+        """
+        legal = list(board.legal_moves)
+        best_move = None
+        best_score = -1e9
+        # precompute base sequence as list of uci strings
+        for mv in legal:
+            cand = mv.uci()
+            seq = history_moves + [cand]
+            seq_ids = [ self.move_to_idx.get(m, self.move_to_idx.get("<UNK>", 1)) for m in seq[-self.model.seq_len:] ]
+            if len(seq_ids) < self.model.seq_len:
+                seq_ids = [0]*(self.model.seq_len - len(seq_ids)) + seq_ids
+            arr = np.array(seq_ids, dtype=np.int32)[None,:]
+            style_batch = np.tile(self.style_vec[None,:], (1,1)).astype(np.float32)
+            logits = self.model.forward(arr, style_batch)   # (1, V)
+            probs = softmax(logits)[0]
+            # score candidate as probability assigned to its index
+            cand_idx = self.move_to_idx.get(cand, self.move_to_idx.get("<UNK>",1))
+            score = float(probs[cand_idx])
+            if score > best_score:
+                best_score = score
+                best_move = cand
+        if best_move is None:
+            # fallback random legal
+            best_move = random.choice(legal).uci()
+        return best_move
+
+    def game_handler(self, game_id: str, my_color: chess.Color):
+        LOG.info("handler start %s", game_id)
+        stream = self.client.bots.stream_game_state(game_id)
+        history_moves = []
+        board = chess.Board()
+        for ev in stream:
             try:
-                if event.get("type") in ("gameFull", "gameState"):
-                    state = event.get("state", event)
-                    moves_s = state.get("moves", "")
-                    moves = moves_s.split() if moves_s else []
+                if ev['type'] in ('gameFull', 'gameState'):
+                    state = ev.get('state', ev)
+                    moves_s = state.get('moves', '')
+                    history_moves = moves_s.split() if moves_s else []
                     board = chess.Board()
-                    for m in moves:
+                    for mv in history_moves:
                         try:
-                            board.push_uci(m)
+                            board.push_uci(mv)
                         except Exception:
                             pass
                     with self.lock:
-                        self.active_games.setdefault(game_id, {"moves": [], "last_thought": None, "white": None, "black": None, "result": None})
-                        self.active_games[game_id]["moves"] = moves[:]
-                    if not board.is_game_over() and board.turn == my_color:
-                        # model inference
-                        choice, probs = predict_move_from_model_tf(self.model, board, temperature=self.temp, argmax=self.argmax)
-                        if choice is None:
-                            # fallback
-                            if self.engine:
-                                try:
-                                    r = self.engine.play(board, chess.engine.Limit(time=0.05))
-                                    choice = r.move.uci()
-                                except Exception:
-                                    choice = None
-                            if choice is None:
-                                legal = list(board.legal_moves)
-                                # simple heuristic: capture preferred else center
-                                best = None
-                                best_score = -1e9
-                                for m in legal:
-                                    score = 0
-                                    if board.is_capture(m):
-                                        score += 10
-                                    to_sq = m.to_square
-                                    file = chess.square_file(to_sq)
-                                    rank = chess.square_rank(to_sq)
-                                    if 2 <= file <= 5 and 2 <= rank <= 5:
-                                        score += 1
-                                    if score > best_score:
-                                        best_score = score
-                                        best = m
-                                choice = best.uci() if best else random.choice([m.uci() for m in legal])
-                        LOG.info("Game %s play %s", game_id, choice)
-                        with self.lock:
-                            self.active_games[game_id]["last_thought"] = {"choice": choice, "probs": probs}
+                        self.active_games[game_id] = {'moves': history_moves.copy(), 'last_thought': None}
+                    # if it's our turn
+                    our_turn = (board.turn == chess.WHITE and my_color == chess.WHITE) or (board.turn == chess.BLACK and my_color == chess.BLACK)
+                    if our_turn and (not board.is_game_over()):
+                        LOG.info("[%s] our turn, computing candidate scores...", game_id)
+                        chosen = self.score_candidate_moves(board, history_moves)
                         try:
-                            self.client.bots.make_move(game_id, choice)
+                            self.client.bots.make_move(game_id, chosen)
+                            LOG.info("[%s] played %s", game_id, chosen)
+                            with self.lock:
+                                self.active_games[game_id]['last_thought'] = {'choice': chosen}
                         except Exception:
-                            LOG.exception("Failed to send move %s for game %s", choice, game_id)
-                elif event.get("type") == "gameFinish":
-                    LOG.info("Game %s finished: %s", game_id, event)
-                    # try to export pgn
-                    try:
-                        pgn_text = self.client.games.export(game_id)
-                        outp = Path("live_games")
-                        outp.mkdir(exist_ok=True)
-                        with open(outp / f"{game_id}.pgn", "w", encoding="utf-8") as fh:
-                            fh.write(pgn_text)
-                        LOG.info("Saved finished PGN %s", game_id)
-                    except Exception:
-                        LOG.exception("Failed to export game %s", game_id)
+                            LOG.exception("Failed to send move %s for game %s", chosen, game_id)
+                elif ev['type'] == 'gameFinish':
+                    LOG.info("Finished %s", game_id)
+                    # optionally, add to fine-tune buffer
+                    if self.fine_tune:
+                        # derive (contexts->target) triples from moves and append to buffer
+                        moves = ev.get('moves', '') or ''
+                        if moves:
+                            seq = moves.split()
+                            for i in range(len(seq)):
+                                ctx = seq[max(0, i - self.model.seq_len):i]
+                                ids = [ self.move_to_idx.get(m, self.move_to_idx.get("<UNK>",1)) for m in ctx ]
+                                if len(ids) < self.model.seq_len:
+                                    ids = [0]*(self.model.seq_len - len(ids)) + ids
+                                target = self.move_to_idx.get(seq[i], self.move_to_idx.get("<UNK>",1))
+                                with self.lock:
+                                    self.recent_games_buffer.append((ids, target))
+                                    # keep buffer small
+                                    if len(self.recent_games_buffer) > 5000:
+                                        self.recent_games_buffer = self.recent_games_buffer[-4000:]
             except Exception:
-                LOG.exception("Exception in game stream %s", game_id)
-            if self._stop.is_set():
-                LOG.info("Stopping handler %s", game_id)
-                break
+                LOG.exception("Error in game_handler %s", game_id)
 
     def incoming_loop(self):
         backoff = 1
-        while not self._stop.is_set():
+        while True:
             try:
-                LOG.info("Opening incoming events stream")
-                for event in self.client.bots.stream_incoming_events():
-                    if self._stop.is_set():
-                        break
-                    try:
-                        typ = event.get("type")
-                        LOG.debug("Incoming event %s", typ)
-                        if typ == "challenge":
-                            self.accept_challenge(event["challenge"])
-                        elif typ == "gameStart":
-                            gid = event["game"]["id"]
-                            color = event["game"].get("color", "white")
-                            my_color = chess.WHITE if color == "white" else chess.BLACK
-                            t = threading.Thread(target=self.handle_game, args=(gid, my_color), daemon=True)
-                            t.start()
-                    except Exception:
-                        LOG.exception("Error processing incoming event")
-                LOG.warning("Incoming stream closed; reconnecting in %ds", backoff)
+                for ev in self.client.bots.stream_incoming_events():
+                    t = ev.get('type')
+                    if t == 'challenge':
+                        self.accept_challenge(ev['challenge'])
+                    elif t == 'gameStart':
+                        gid = ev['game']['id']
+                        color_str = ev['game'].get('color', 'white')
+                        my_color = chess.WHITE if color_str == 'white' else chess.BLACK
+                        th = threading.Thread(target=self.game_handler, args=(gid, my_color), daemon=True)
+                        th.start()
             except Exception:
-                LOG.exception("Exception in incoming loop")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 120)
+                LOG.exception("incoming loop error; reconnecting in %ds", backoff)
+                time.sleep(backoff)
+                backoff = min(120, backoff*2)
 
-    def start(self):
-        self._stop.clear()
+    def fine_tune_worker(self, lr=1e-4, iters=10):
+        """
+        Small periodic fine-tune on buffered self-play games.
+        """
+        LOG.info("Fine-tune worker started")
+        while True:
+            time.sleep(60)  # run every minute
+            with self.lock:
+                if len(self.recent_games_buffer) < 64:
+                    continue
+                # take a small sample
+                sample = random.sample(self.recent_games_buffer, min(512, len(self.recent_games_buffer)))
+            X = np.array([s[0] for s in sample], dtype=np.int32)
+            y = np.array([s[1] for s in sample], dtype=np.int32)
+            opt = Adam(self.model.params, lr=lr)
+            # do a few micro-batches
+            B = 64
+            n = len(y)
+            for start in range(0, n, B):
+                xb = X[start:start+B]
+                yb = y[start:start+B]
+                sb = np.tile(self.style_vec[None,:], (xb.shape[0],1)).astype(np.float32)
+                logits = self.model.forward(xb, sb)
+                loss, dlogits = cross_entropy_and_grad(logits, yb)
+                for p in self.model.params: p.zero_grad()
+                self.model.backward(dlogits)
+                opt.step()
+            LOG.info("Fine-tune step done (buffer items=%d)", len(self.recent_games_buffer))
+
+    def start(self, serve=False, port=10000):
         t = threading.Thread(target=self.incoming_loop, daemon=True)
         t.start()
-
-    def stop(self):
-        self._stop.set()
-        if self.engine:
-            try:
-                self.engine.quit()
-            except Exception:
-                pass
-
-# -------------------------
-# CLI / orchestration
-# -------------------------
-APP = Flask(__name__) if Flask else None
-GLOBAL_BOT = None
-
-if APP:
-    @APP.route("/")
-    def index():
-        return "IWCM TensorFlow Bot Running"
-
-    @APP.route("/_games")
-    def api_games():
-        if GLOBAL_BOT is None:
-            return jsonify({})
-        with GLOBAL_BOT.lock:
-            return jsonify(GLOBAL_BOT.active_games)
-
-def train_main(args):
-    # 1) build moves.npz if requested
-    if args.moves and not os.path.exists(args.moves):
-        LOG.info("Saving moves vocab to %s", args.moves)
-        np.savez_compressed(args.moves, moves=np.array(ALL_UCI, dtype=object))
-
-    # 2) build samples or load existing samples npz
-    samples_npz = args.samples_npz or "samples.npz"
-    if args.pgn_dir or args.pgn_zip:
-        builder = PGNSampleBuilder(pgn_dir=args.pgn_dir, pgn_zip=args.pgn_zip)
-        builder.build()
-        if len(builder.samples) == 0:
-            LOG.error("No samples built from PGNs.")
-            return
-        # Save as samples.npz for faster reuse
-        LOG.info("Saving samples to %s", samples_npz)
-        boards = np.stack([s[0] for s in builder.samples], axis=0).astype(np.float32)
-        targets = np.array([s[1] for s in builder.samples], dtype=np.int32)
-        np.savez_compressed(samples_npz, boards=boards, targets=targets)
-    elif not os.path.exists(samples_npz):
-        LOG.error("No PGNs provided and no samples npz found.")
-        return
-
-    # 3) make tf datasets
-    train_ds, val_ds = make_tf_dataset_from_npz(samples_npz, batch=args.batch, shuffle=True, val_split=args.val_split)
-
-    # 4) build or load model
-    model = build_model(input_shape=(8,8,13), channels=args.channels)
-    opt = keras.optimizers.Adam(learning_rate=args.lr)
-    loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    model.compile(optimizer=opt, loss=loss, metrics=["sparse_categorical_accuracy"])
-    start_epoch = 0
-    if args.model and os.path.exists(args.model):
-        try:
-            model = keras.models.load_model(args.model)
-            LOG.info("Loaded model from %s", args.model)
-        except Exception:
-            LOG.exception("Failed to load model; will train from scratch.")
-
-    # 5) callbacks
-    callbacks = []
-    if args.model:
-        ckpt = keras.callbacks.ModelCheckpoint(args.model, save_best_only=False, save_weights_only=False, verbose=1)
-        callbacks.append(ckpt)
-    if args.early_stop:
-        callbacks.append(keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True))
-
-    # 6) train
-    LOG.info("Training: epochs=%d batch=%d samples ~ %d", args.epochs, args.batch, sum(1 for _ in train_ds.unbatch()))
-    model.fit(train_ds, validation_data=val_ds, epochs=args.epochs, callbacks=callbacks, verbose=2)
-    if args.model:
-        try:
-            model.save(args.model)
-            LOG.info("Saved final model to %s", args.model)
-        except Exception:
-            LOG.exception("Failed to save final model")
-
-def bot_main(args):
-    if not args.model or not os.path.exists(args.model):
-        LOG.error("Model file required for bot mode.")
-        return
-    LOG.info("Loading model from %s", args.model)
-    model = keras.models.load_model(args.model)
-    token = args.token or os.getenv("LICHESS_TOKEN")
-    if not token:
-        LOG.error("No Lichess token provided (env LICHESS_TOKEN or --token).")
-        return
-    bot = TFTorchLichessBot(token, model, moves_path=args.moves, temp=args.temp, argmax=args.argmax, stockfish_path=args.stockfish)
-    global GLOBAL_BOT
-    GLOBAL_BOT = bot
-    bot.start()
-    if args.serve and APP:
-        APP.run(host="0.0.0.0", port=args.port, threaded=True)
-    else:
-        try:
+        if self.fine_tune:
+            tf = threading.Thread(target=self.fine_tune_worker, daemon=True)
+            tf.start()
+        if serve and Flask:
+            app = Flask("style_bot")
+            @app.route("/")
+            def home():
+                return "Style bot running"
+            @app.route("/games")
+            def games():
+                with self.lock:
+                    return json.dumps(self.active_games)
+            app.run(host="0.0.0.0", port=port)
+        else:
             while True:
-                time.sleep(5)
-        except KeyboardInterrupt:
-            bot.stop()
+                time.sleep(10)
 
-def make_parser():
-    p = argparse.ArgumentParser(description="IWCM TensorFlow master")
+# -----------------------
+# CLI
+# -----------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--build", action="store_true")
+    p.add_argument("--pgn_zip", type=str, default=None)
+    p.add_argument("--pgn_dir", type=str, default=None)
+    p.add_argument("--vocab", type=str, default=VOCAB_FILE)
+    p.add_argument("--build_samples", action="store_true")
+    p.add_argument("--samples", type=str, default=SAMPLES_FILE)
+    p.add_argument("--seq_len", type=int, default=DEFAULT_SEQ_LEN)
+    p.add_argument("--compute_style", action="store_true")
+    p.add_argument("--style_out", type=str, default=STYLE_FILE)
     p.add_argument("--train", action="store_true")
-    p.add_argument("--pgn_dir", default=None)
-    p.add_argument("--pgn_zip", default=None)
-    p.add_argument("--samples_npz", default=None)
-    p.add_argument("--model", default="model.h5")
-    p.add_argument("--moves", default="moves.npz")
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--channels", type=int, default=64)
-    p.add_argument("--early_stop", action="store_true")
-    p.add_argument("--val_split", type=float, default=0.05)
+    p.add_argument("--model", type=str, default=MODEL_FILE)
+    p.add_argument("--epochs", type=int, default=EPOCHS)
+    p.add_argument("--batch", type=int, default=BATCH_SIZE)
+    p.add_argument("--lr", type=float, default=LR)
     p.add_argument("--bot", action="store_true")
+    p.add_argument("--token", type=str, default=None)
     p.add_argument("--serve", action="store_true")
     p.add_argument("--port", type=int, default=10000)
-    p.add_argument("--token", default=None)
-    p.add_argument("--temp", type=float, default=0.7)
-    p.add_argument("--argmax", action="store_true")
-    p.add_argument("--stockfish", default=None)
-    return p
+    p.add_argument("--fine_tune", action="store_true")
+    return p.parse_args()
 
-def main(argv=None):
-    args = make_parser().parse_args(argv)
+def main():
+    args = parse_args()
+    if args.build:
+        vocab = generate_move_vocab_from_pgns(pgn_zip=args.pgn_zip, pgn_dir=args.pgn_dir)
+        save_vocab(vocab, args.vocab)
+        save_idx_to_move(vocab, args.vocab.replace(".npz", ".inv.npz"))
+    if args.build_samples:
+        vocab = load_vocab(args.vocab)
+        builder = DatasetBuilder(vocab=vocab, seq_len=args.seq_len)
+        if args.pgn_zip:
+            builder.build_from_zip(args.pgn_zip, out_npz=args.samples)
+        elif args.pgn_dir:
+            builder.build_from_dir(args.pgn_dir, out_npz=args.samples)
+        else:
+            LOG.error("Provide --pgn_zip or --pgn_dir to build samples")
+    if args.compute_style:
+        vocab = load_vocab(args.vocab)
+        style_vec = compute_style_from_pgns(pgn_zip=args.pgn_zip, pgn_dir=args.pgn_dir, vocab=vocab, style_dim=STYLE_DIM)
+        np.savez_compressed(args.style_out, style=style_vec)
+        LOG.info("Saved style vector to %s", args.style_out)
     if args.train:
-        train_main(args)
-    elif args.bot:
-        bot_main(args)
-    else:
-        print("Nothing to do. Use --train or --bot")
+        vocab = load_vocab(args.vocab)
+        inv = load_idx_to_move(args.vocab.replace(".npz", ".inv.npz"))
+        d = np.load(args.style_out, allow_pickle=True)
+        style = d["style"]
+        model = SimpleModel(vocab_size=len(vocab), seq_len=args.seq_len, emb_dim=EMBED_DIM, style_dim=STYLE_DIM, hidden=FF_DIM)
+        trainer = Trainer(model, samples_path=args.samples, style_vec=style, batch=args.batch, lr=args.lr)
+        trainer.train(epochs=args.epochs, save_path=args.model)
+    if args.bot:
+        if not os.path.exists(args.model):
+            LOG.error("Model missing: %s", args.model)
+            return
+        vocab = load_vocab(args.vocab)
+        idx_to_move = load_idx_to_move(args.vocab.replace(".npz", ".inv.npz"))
+        model = SimpleModel.load(args.model)
+        d = np.load(args.style_out, allow_pickle=True)
+        style = d["style"]
+        token = args.token or os.getenv("LICHESS_TOKEN")
+        if token is None:
+            LOG.error("Provide token via --token or env LICHESS_TOKEN")
+            return
+        bot = StyleLichessBot(token, model, vocab, idx_to_move, style_vec=style, fine_tune=args.fine_tune)
+        bot.start(serve=args.serve, port=args.port)
 
 if __name__ == "__main__":
     main()
